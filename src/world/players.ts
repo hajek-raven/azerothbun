@@ -3,7 +3,7 @@ import { log } from "../log.ts";
 import { ByteWriter } from "../net/byte-buffer.ts";
 import { SMSG_DESTROY_OBJECT, SMSG_UPDATE_OBJECT } from "./packets.ts";
 import { spawnUpdatePayloads, visibilityDistance } from "./spawn.ts";
-import { playerUpdateBlock } from "./update-object.ts";
+import { playerUpdateBlock, type PlayerFieldStats } from "./update-object.ts";
 
 export type Place = { map: number; x: number; y: number; z: number };
 
@@ -14,6 +14,8 @@ export type OnlinePlayer = {
   character: () => Character;
   moveTime: () => number;
   standState: () => number;
+  /** Public unit fields other players see (health, power, level, flags). */
+  stats?: () => PlayerFieldStats | undefined;
   send: (opcode: number, payload: Uint8Array) => void;
 };
 
@@ -55,11 +57,11 @@ export class PlayerView {
         continue;
       }
       player.known.add(guid);
-      creates.push(playerUpdateBlock(other.character(), false, other.moveTime(), other.standState()));
+      creates.push(playerUpdateBlock(other.character(), false, other.moveTime(), other.standState(), other.stats?.()));
       log("world", `${player.character().name} sees ${other.character().name}`);
       if (!other.known.has(player.guid)) {
         other.known.add(player.guid);
-        sendUpdate(other, [playerUpdateBlock(player.character(), false, player.moveTime(), player.standState())], []);
+        sendUpdate(other, [playerUpdateBlock(player.character(), false, player.moveTime(), player.standState(), player.stats?.())], []);
       }
     }
     return { creates, gone };
@@ -79,6 +81,11 @@ export class PlayerView {
         other.send(SMSG_DESTROY_OBJECT, payload);
       }
     }
+  }
+
+  /** One packet to one player in world (`ObjectAccessor::FindPlayer` → `SendDirectMessage`). */
+  send(guid: number, opcode: number, payload: Uint8Array): void {
+    this.online.get(guid)?.send(opcode, payload);
   }
 
   broadcast(guid: number, opcode: number, payload: Uint8Array): void {

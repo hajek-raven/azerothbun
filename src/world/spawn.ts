@@ -12,6 +12,7 @@ const OBJECT_FIELD_GUID = 0x0000;
 const OBJECT_FIELD_TYPE = 0x0002;
 const OBJECT_FIELD_ENTRY = 0x0003;
 const OBJECT_FIELD_SCALE_X = 0x0004;
+const UNIT_FIELD_TARGET = OBJECT_END + 0x000c;
 const UNIT_FIELD_BYTES_0 = OBJECT_END + 0x0011;
 const UNIT_FIELD_HEALTH = OBJECT_END + 0x0012;
 const UNIT_FIELD_POWER1 = OBJECT_END + 0x0013;
@@ -115,11 +116,26 @@ export function indexSpawns(world: WorldData): SpawnIndex {
   return { cells };
 }
 
+/** Runtime overrides for a creature's create block (health, position, flags). `hidden` removes it from view. */
+export type LiveCreatureView = {
+  hidden: boolean;
+  health: number;
+  x: number;
+  y: number;
+  z: number;
+  o: number;
+  unitFlags: number;
+  dynamicFlags: number;
+  npcFlags: number;
+  target: bigint;
+};
+
 export function diffVisible(
   index: SpawnIndex,
   world: WorldData,
   place: Place,
   known: Set<bigint>,
+  live?: (spawnGuid: number) => LiveCreatureView | null,
 ): { creates: Uint8Array[]; gone: bigint[] } {
   const now = new Set<bigint>();
   const creates: Uint8Array[] = [];
@@ -128,10 +144,14 @@ export function diffVisible(
     if (!template || creatureModel(template).displayId <= 0) {
       continue;
     }
+    const view = live?.(spawn.guid) ?? null;
+    if (view?.hidden) {
+      continue;
+    }
     const guid = creatureGuid(spawn.entry, spawn.guid);
     now.add(guid);
     if (!known.has(guid)) {
-      creates.push(creatureCreateBlock(spawn, template, world));
+      creates.push(creatureCreateBlock(spawn, template, world, view));
       known.add(guid);
     }
   }
@@ -334,7 +354,12 @@ export function itemQueryPayload(world: WorldData, entry: number): Uint8Array {
     .toUint8Array();
 }
 
-export function creatureCreateBlock(spawn: CreatureSpawn, template: CreatureTemplate, world?: WorldData): Uint8Array {
+export function creatureCreateBlock(
+  spawn: CreatureSpawn,
+  template: CreatureTemplate,
+  world?: WorldData,
+  live: LiveCreatureView | null = null,
+): Uint8Array {
   const model = creatureModel(template);
   const stored = template.models.find((row) => row.displayId === model.displayId);
   const scale = model.scale > 0 ? model.scale : 1;
@@ -361,8 +386,12 @@ export function creatureCreateBlock(spawn: CreatureSpawn, template: CreatureTemp
   setFloat(values, OBJECT_FIELD_SCALE_X, scale);
   values[UNIT_FIELD_BYTES_0] =
     (template.unitClass << 8) | ((stored?.gender ?? 2) << 16) | (powerForClass(template.unitClass) << 24);
-  values[UNIT_FIELD_HEALTH] = health;
+  values[UNIT_FIELD_HEALTH] = live ? live.health : health;
   values[UNIT_FIELD_MAXHEALTH] = health;
+  if (live && live.target !== 0n) {
+    values[UNIT_FIELD_TARGET] = Number(live.target & 0xffffffffn);
+    values[UNIT_FIELD_TARGET + 1] = Number((live.target >> 32n) & 0xffffffffn);
+  }
   if (mana > 0) {
     values[UNIT_FIELD_POWER1] = mana;
     values[UNIT_FIELD_MAXPOWER1] = mana;
@@ -372,7 +401,7 @@ export function creatureCreateBlock(spawn: CreatureSpawn, template: CreatureTemp
   values[UNIT_VIRTUAL_ITEM_SLOT_ID] = items[0];
   values[UNIT_VIRTUAL_ITEM_SLOT_ID + 1] = items[1];
   values[UNIT_VIRTUAL_ITEM_SLOT_ID + 2] = items[2];
-  values[UNIT_FIELD_FLAGS] = flags.unitFlags;
+  values[UNIT_FIELD_FLAGS] = live ? live.unitFlags : flags.unitFlags;
   values[UNIT_FIELD_FLAGS_2] = template.unitFlags2;
   setFloat(values, UNIT_FIELD_BOUNDINGRADIUS, (stored?.boundingRadius ?? 0) * scale);
   setFloat(values, UNIT_FIELD_COMBATREACH, (stored?.combatReach ?? 0) * scale);
@@ -390,9 +419,9 @@ export function creatureCreateBlock(spawn: CreatureSpawn, template: CreatureTemp
     }
     values[UNIT_FIELD_ATTACK_POWER] = generated.attackPower;
   }
-  values[UNIT_DYNAMIC_FLAGS] = flags.dynamicFlags;
+  values[UNIT_DYNAMIC_FLAGS] = live ? live.dynamicFlags : flags.dynamicFlags;
   setFloat(values, UNIT_MOD_CAST_SPEED, 1);
-  values[UNIT_NPC_FLAGS] = flags.npcFlags;
+  values[UNIT_NPC_FLAGS] = live ? live.npcFlags : flags.npcFlags;
   values[UNIT_FIELD_BYTES_2] = SHEATH_STATE_MELEE;
   setFloat(values, UNIT_FIELD_HOVERHEIGHT, template.hoverHeight > 0 ? template.hoverHeight : 1);
 
@@ -404,15 +433,17 @@ export function creatureCreateBlock(spawn: CreatureSpawn, template: CreatureTemp
     .writeU32(0)
     .writeU16(0)
     .writeU32(Date.now())
-    .writeF32(spawn.x)
-    .writeF32(spawn.y)
-    .writeF32(spawn.z)
-    .writeF32(spawn.orientation)
+    .writeF32(live ? live.x : spawn.x)
+    .writeF32(live ? live.y : spawn.y)
+    .writeF32(live ? live.z : spawn.z)
+    .writeF32(live ? live.o : spawn.orientation)
     .writeU32(0);
   for (const speed of creatureSpeeds(template)) {
     body.writeF32(speed);
   }
-  writeValues(body, values);
+  // Dynamic and npc flags stay in the mask even at 0. The client only applies a later
+  // lootable / gossip change for a field that was present on the create.
+  writeValues(body, values, new Set([UNIT_DYNAMIC_FLAGS, UNIT_NPC_FLAGS]));
   return body.toUint8Array();
 }
 
@@ -447,6 +478,31 @@ export function gameObjectCreateBlock(spawn: GameObjectSpawn, template: GameObje
     .writeU64(packedWorldRotation(rotation));
   writeValues(body, values);
   return body.toUint8Array();
+}
+
+/** Creature spawns within `radius` of a point on the same map (spawn-row positions). */
+export function creaturesNear(index: SpawnIndex, place: Place, radius: number): CreatureSpawn[] {
+  const span = Math.ceil(radius / CELL_SIZE);
+  const cx = cellOf(place.x);
+  const cy = cellOf(place.y);
+  const found: CreatureSpawn[] = [];
+  for (let dx = -span; dx <= span; dx++) {
+    for (let dy = -span; dy <= span; dy++) {
+      const bucket = index.cells.get(`${place.map}:${cx + dx}:${cy + dy}`);
+      if (!bucket) {
+        continue;
+      }
+      for (const spawn of bucket.creatures) {
+        const ddx = spawn.x - place.x;
+        const ddy = spawn.y - place.y;
+        const ddz = spawn.z - place.z;
+        if (ddx * ddx + ddy * ddy + ddz * ddz <= radius * radius) {
+          found.push(spawn);
+        }
+      }
+    }
+  }
+  return found;
 }
 
 function nearbyCreatures(index: SpawnIndex, place: Place): CreatureSpawn[] {
@@ -573,7 +629,7 @@ function setFloat(values: Uint32Array, index: number, value: number): void {
   new DataView(values.buffer).setFloat32(index * 4, value, true);
 }
 
-function writeValues(body: ByteWriter, values: Uint32Array): void {
+function writeValues(body: ByteWriter, values: Uint32Array, force?: ReadonlySet<number>): void {
   const blocks = Math.ceil(values.length / 32);
   body.writeU8(blocks);
   const present: number[] = [];
@@ -581,7 +637,7 @@ function writeValues(body: ByteWriter, values: Uint32Array): void {
     let mask = 0;
     for (let bit = 0; bit < 32; bit++) {
       const index = block * 32 + bit;
-      if (index < values.length && values[index] !== 0) {
+      if (index < values.length && (values[index] !== 0 || force?.has(index))) {
         mask |= 1 << bit;
         present.push(index);
       }

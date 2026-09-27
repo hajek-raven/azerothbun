@@ -1,4 +1,6 @@
-import type { Database } from "bun:sqlite";
+import { eq } from "drizzle-orm";
+import type { Db } from "../../database/database.ts";
+import { account } from "../../database/schema/auth.ts";
 import { makeRegistrationData, upperLatin } from "../../crypto/srp6.ts";
 import { MAX_ACCOUNT_STR, MAX_EMAIL_STR, MAX_PASS_STR } from "../../shared/limits.ts";
 
@@ -22,7 +24,8 @@ function utf8Length(value: string): number {
   return length;
 }
 
-export function createAccount(db: Database, username: string, password: string, email = "", expansion = 2): AccountOpResult {
+/** `AccountMgr::CreateAccount`. */
+export async function createAccount(db: Db, username: string, password: string, email = "", expansion = 2): Promise<AccountOpResult> {
   if (utf8Length(username) > MAX_ACCOUNT_STR) {
     return AccountOpResult.NameTooLong;
   }
@@ -35,29 +38,25 @@ export function createAccount(db: Database, username: string, password: string, 
   const name = upperLatin(username);
   const pass = upperLatin(password);
   const mail = upperLatin(email);
-  const existing = db.query<{ id: number }, { username: string }>("SELECT id FROM account WHERE username = $username").get({ username: name });
+  const [existing] = await db.select({ id: account.id }).from(account).where(eq(account.username, name));
   if (existing) {
     return AccountOpResult.NameAlreadyExists;
   }
   const registration = makeRegistrationData(name, pass);
   try {
-    db.query(
-      `INSERT INTO account (username, salt, verifier, expansion, reg_mail, email, joindate)
-       VALUES ($username, $salt, $verifier, $expansion, $email, $email, CURRENT_TIMESTAMP)`,
-    ).run({
+    // LOGIN_INS_ACCOUNT, then LOGIN_INS_REALM_CHARACTERS_INIT.
+    await db.insert(account).values({
       username: name,
       salt: registration.salt,
       verifier: registration.verifier,
       expansion,
+      reg_mail: mail,
       email: mail,
+      joindate: new Date(),
     });
-    db.query(
-      `INSERT INTO realmcharacters (realmid, acctid, numchars)
-       SELECT realmlist.id, account.id, 0
-       FROM realmlist, account
-       LEFT JOIN realmcharacters ON acctid = account.id
-       WHERE acctid IS NULL`,
-    ).run();
+    await db.$client.unsafe(
+      "INSERT INTO realmcharacters (realmid, acctid, numchars) SELECT realmlist.id, account.id, 0 FROM realmlist, account LEFT JOIN realmcharacters ON acctid=account.id WHERE acctid IS NULL",
+    );
   } catch {
     return AccountOpResult.DbInternalError;
   }

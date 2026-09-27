@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import type { Socket } from "bun";
 import type { CreatureSpawn, CreatureTemplate, GameObjectSpawn, GameObjectTemplate, ItemTemplate, WorldData } from "../data/world.ts";
 import { WorldCrypt } from "../crypto/world-crypt.ts";
-import { openAuthDatabase, saveSessionKey } from "../db.ts";
+import { seededTestDatabases } from "../database/test-db.ts";
+import { saveSessionKey } from "../db.ts";
 import { ByteReader, ByteWriter } from "../net/byte-buffer.ts";
 import {
   authSeed,
@@ -100,17 +101,17 @@ test("visibility matches continent range, phase, and normal spawn mask", () => {
 test("login sends the creatures standing next to the character", async () => {
   const sessionKey = new Uint8Array(40);
   crypto.getRandomValues(sessionKey);
-  const db = openAuthDatabase(":memory:");
-  saveSessionKey(db, "TEST", sessionKey);
+  const db = await seededTestDatabases();
+  await saveSessionKey(db.login, "TEST", sessionKey);
   const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db, world: fakeWorld() });
   const client = await connect(server.port ?? 0);
   const crypt = await login(client, sessionKey);
 
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array(), crypt));
   let spawn: Uint8Array | null = null;
-  for (let index = 0; index < 18; index++) {
+  for (let index = 0; index < 17; index++) {
     const packet = await readServerPacket(client, crypt);
-    if (index === 17) {
+    if (index === 16) {
       spawn = packet.payload;
       expect(packet.opcode).toBe(SMSG_UPDATE_OBJECT);
     }
@@ -153,7 +154,7 @@ function fakeWorld(): WorldData {
     itemTemplate: (entry: number) => items.get(entry),
     playerStart: () => null,
     questItems: () => [0, 0, 0, 0, 0, 0],
-  } as WorldData;
+  } as unknown as WorldData;
 }
 
 function mcbride(): CreatureTemplate {
@@ -359,6 +360,7 @@ async function login(client: TestClient, sessionKey: Uint8Array): Promise<WorldC
   expect(response.opcode).toBe(SMSG_AUTH_RESPONSE);
   await readServerPacket(client, crypt);
   await readServerPacket(client, crypt);
+  await readServerPacket(client, crypt);
   client.send(encodeClientPacket(CMSG_CHAR_ENUM, new Uint8Array(0), crypt));
   const characters = await readServerPacket(client, crypt);
   expect(characters.opcode).toBe(SMSG_CHAR_ENUM);
@@ -368,10 +370,17 @@ async function login(client: TestClient, sessionKey: Uint8Array): Promise<WorldC
 type ServerPacket = { opcode: number; payload: Uint8Array; raw: Uint8Array };
 
 async function readServerPacket(client: TestClient, crypt: WorldCrypt | null): Promise<ServerPacket> {
-  const header = await client.read(4);
+  let header = await client.read(4);
   crypt?.decryptHeader(header);
-  const size = (header[0]! << 8) | header[1]!;
-  const opcode = header[2]! | (header[3]! << 8);
+  if ((header[0]! & 0x80) !== 0) {
+    // `ServerPktHeader` for packets over 0x7FFF bytes: a 3-byte size, decrypted as one stream with the rest.
+    const last = await client.read(1);
+    crypt?.decryptHeader(last);
+    header = Uint8Array.of(...header, last[0]!);
+  }
+  const large = header.length === 5;
+  const size = large ? ((header[0]! & 0x7f) << 16) | (header[1]! << 8) | header[2]! : (header[0]! << 8) | header[1]!;
+  const opcode = large ? header[3]! | (header[4]! << 8) : header[2]! | (header[3]! << 8);
   const payload = await client.read(size - 2);
   const raw = new Uint8Array(header.length + payload.length);
   raw.set(header, 0);

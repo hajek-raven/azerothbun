@@ -1,5 +1,8 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { testDatabases } from "../database/test-db.ts";
+import { realmcharacters } from "../database/schema/auth.ts";
+import { character_action, character_homebind, character_skills, character_spell, characters } from "../database/schema/characters.ts";
 import type { PlayerStart } from "../data/player-create.ts";
 import { CHAR_CREATE_NAME_IN_USE, CHAR_NAME_THREE_CONSECUTIVE, CHAR_NAME_TOO_SHORT } from "../world/character-packets.ts";
 import { loadCharacterKit } from "./store.ts";
@@ -38,47 +41,12 @@ const HUMAN_WARRIOR: PlayerStart = {
   },
 };
 
-function openDb(): Database {
-  const db = new Database(":memory:", { strict: true });
-  db.exec(`
-    CREATE TABLE characters (
-      guid INTEGER PRIMARY KEY,
-      account INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      race INTEGER NOT NULL DEFAULT 0,
-      class INTEGER NOT NULL DEFAULT 0,
-      gender INTEGER NOT NULL DEFAULT 0,
-      level INTEGER NOT NULL DEFAULT 1,
-      skin INTEGER NOT NULL DEFAULT 0,
-      face INTEGER NOT NULL DEFAULT 0,
-      hairStyle INTEGER NOT NULL DEFAULT 0,
-      hairColor INTEGER NOT NULL DEFAULT 0,
-      facialStyle INTEGER NOT NULL DEFAULT 0,
-      position_x REAL NOT NULL DEFAULT 0,
-      position_y REAL NOT NULL DEFAULT 0,
-      position_z REAL NOT NULL DEFAULT 0,
-      map INTEGER NOT NULL DEFAULT 0,
-      zone INTEGER NOT NULL DEFAULT 0,
-      orientation REAL NOT NULL DEFAULT 0,
-      health INTEGER NOT NULL DEFAULT 0,
-      taximask TEXT NOT NULL,
-      innTriggerId INTEGER NOT NULL
-    );
-    CREATE TABLE realmcharacters (
-      realmid INTEGER NOT NULL,
-      acctid INTEGER NOT NULL,
-      numchars INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (realmid, acctid)
-    );
-  `);
-  return db;
-}
-
-test("create stores spells, actions, skills, and a homebind that stays put", () => {
-  const db = openDb();
+test("create stores spells, actions, skills, and a homebind that stays put", async () => {
+  const { login, characters: db } = await testDatabases();
   const kit = kitFromStart(HUMAN_WARRIOR);
-  const guid = createPlayableCharacter(
+  const guid = await createPlayableCharacter(
     db,
+    login,
     {
       accountId: 1,
       name: "Aldan",
@@ -101,8 +69,8 @@ test("create stores spells, actions, skills, and a homebind that stays put", () 
     },
     kit,
   );
-  db.query("UPDATE characters SET position_x = 1 WHERE guid = $guid").run({ guid });
-  const loaded = loadCharacterKit(db, guid);
+  await db.update(characters).set({ position_x: 1 }).where(eq(characters.guid, guid));
+  const loaded = await loadCharacterKit(db, guid);
   expect(loaded.spells).toEqual([78, 6603]);
   expect(loaded.actions).toEqual([
     { button: 72, action: 6603, type: 0 },
@@ -110,21 +78,20 @@ test("create stores spells, actions, skills, and a homebind that stays put", () 
   ]);
   expect(loaded.skills).toEqual([{ skill: 26, value: 1, max: 5 }]);
   expect(loaded.homebind).toEqual({ mapId: 0, zoneId: 12, posX: -8949.95, posY: -132.493, posZ: 83.5312 });
-  const place = db.query<{ position_x: number }, { guid: number }>("SELECT position_x FROM characters WHERE guid = $guid").get({ guid });
+  const [place] = await db.select({ position_x: characters.position_x }).from(characters).where(eq(characters.guid, guid));
   expect(place?.position_x).toBe(1);
-  const realm = db.query<{ numchars: number }, { acctid: number }>("SELECT numchars FROM realmcharacters WHERE acctid = $acctid").get({
-    acctid: 1,
-  });
+  const [realm] = await login.select({ numchars: realmcharacters.numchars }).from(realmcharacters).where(eq(realmcharacters.acctid, 1));
   expect(realm?.numchars).toBe(1);
 });
 
-test("name codes and a one-time starting kit", () => {
-  const db = openDb();
-  expect(characterCreateNameCode(db, "A")).toBe(CHAR_NAME_TOO_SHORT);
-  expect(characterCreateNameCode(db, "Aaa")).toBe(CHAR_NAME_THREE_CONSECUTIVE);
+test("name codes and a one-time starting kit", async () => {
+  const { login, characters: db } = await testDatabases();
+  expect(await characterCreateNameCode(db, "A")).toBe(CHAR_NAME_TOO_SHORT);
+  expect(await characterCreateNameCode(db, "Aaa")).toBe(CHAR_NAME_THREE_CONSECUTIVE);
   const kit = kitFromStart(HUMAN_WARRIOR);
-  createPlayableCharacter(
+  await createPlayableCharacter(
     db,
+    login,
     {
       accountId: 1,
       name: "Aldan",
@@ -147,14 +114,14 @@ test("name codes and a one-time starting kit", () => {
     },
     kit,
   );
-  expect(characterCreateNameCode(db, "aldan")).toBe(CHAR_CREATE_NAME_IN_USE);
-  db.exec("DELETE FROM character_homebind");
-  db.exec("DELETE FROM character_spell");
-  db.exec("DELETE FROM character_action");
-  db.exec("DELETE FROM character_skills");
-  expect(ensureStartingKit(db, 1, kit, 60)).toBe(true);
-  expect(ensureStartingKit(db, 1, kit, 60)).toBe(false);
-  const health = db.query<{ health: number }, []>("SELECT health FROM characters WHERE guid = 1").get();
+  expect(await characterCreateNameCode(db, "aldan")).toBe(CHAR_CREATE_NAME_IN_USE);
+  await db.delete(character_homebind);
+  await db.delete(character_spell);
+  await db.delete(character_action);
+  await db.delete(character_skills);
+  expect(await ensureStartingKit(db, 1, kit, 60)).toBe(true);
+  expect(await ensureStartingKit(db, 1, kit, 60)).toBe(false);
+  const [health] = await db.select({ health: characters.health }).from(characters).where(eq(characters.guid, 1));
   expect(health?.health).toBe(60);
-  expect(loadCharacterKit(db, 1).spells).toEqual([78, 6603]);
+  expect((await loadCharacterKit(db, 1)).spells).toEqual([78, 6603]);
 });

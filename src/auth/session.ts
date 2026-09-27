@@ -1,4 +1,4 @@
-import type { Database } from "bun:sqlite";
+import type { Db } from "../database/database.ts";
 import { equalBytes } from "../crypto/equal-bytes.ts";
 import {
   beginServerChallenge,
@@ -52,9 +52,9 @@ export class AuthSession {
   private reconnectNonce: Uint8Array | null = null;
   private clientBuild = 0;
 
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Db) {}
 
-  handle(packet: Uint8Array): SessionResult {
+  async handle(packet: Uint8Array): Promise<SessionResult> {
     const command = packet[0];
     if (command === undefined) {
       return { action: "close" };
@@ -75,7 +75,7 @@ export class AuthSession {
     }
   }
 
-  private handleLogonChallenge(packet: Uint8Array): SessionResult {
+  private async handleLogonChallenge(packet: Uint8Array): Promise<SessionResult> {
     this.status = "closed";
     const challenge = parseLogonChallenge(packet);
     if (!challenge || challenge.username.length === 0 || challenge.username.length > 16) {
@@ -87,7 +87,7 @@ export class AuthSession {
     }
 
     const username = upperLatin(challenge.username);
-    const account = findAccount(this.db, username);
+    const account = await findAccount(this.db, username);
     if (!account) {
       return { action: "send", packet: logonChallengeFailure(WOW_FAIL_UNKNOWN_ACCOUNT) };
     }
@@ -98,7 +98,7 @@ export class AuthSession {
     return { action: "send", packet: logonChallengeSuccess(this.challenge.B, this.challenge.salt) };
   }
 
-  private handleLogonProof(packet: Uint8Array): SessionResult {
+  private async handleLogonProof(packet: Uint8Array): Promise<SessionResult> {
     this.status = "closed";
     const proof = parseLogonProof(packet);
     if (!this.challenge || !this.account || proof.securityFlags !== 0) {
@@ -110,14 +110,14 @@ export class AuthSession {
       return { action: "send", packet: logonProofFailure() };
     }
 
-    saveSessionKey(this.db, this.account.username, sessionKey);
+    await saveSessionKey(this.db, this.account.username, sessionKey);
     this.account.sessionKey = sessionKey;
     this.challenge = null;
     this.status = "authed";
     return { action: "send", packet: logonProofSuccess(sessionVerifier(proof.A, proof.clientM, sessionKey)) };
   }
 
-  private handleReconnectChallenge(packet: Uint8Array): SessionResult {
+  private async handleReconnectChallenge(packet: Uint8Array): Promise<SessionResult> {
     this.status = "closed";
     const challenge = parseLogonChallenge(packet);
     if (!challenge || challenge.username.length === 0 || challenge.username.length > 16) {
@@ -128,7 +128,7 @@ export class AuthSession {
       return { action: "close", packet: reconnectChallengeFailure() };
     }
 
-    const account = findAccount(this.db, upperLatin(challenge.username));
+    const account = await findAccount(this.db, upperLatin(challenge.username));
     if (!account?.session_key) {
       return { action: "send", packet: reconnectChallengeFailure() };
     }
@@ -154,9 +154,9 @@ export class AuthSession {
     return { action: "send", packet: reconnectProofSuccess() };
   }
 
-  private handleRealmList(): SessionResult {
+  private async handleRealmList(): Promise<SessionResult> {
     this.status = "authed";
-    return { action: "send", packet: realmListPacket(listRealms(this.db), this.clientBuild) };
+    return { action: "send", packet: realmListPacket(await listRealms(this.db), this.clientBuild) };
   }
 }
 

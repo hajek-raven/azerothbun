@@ -1,0 +1,335 @@
+import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { WorldData } from "../data/world.ts";
+import { combatWorldFor } from "../combat/combat-world.ts";
+import { RACE_FACTION_TEMPLATE } from "../combat/faction.ts";
+import { REP_FRIENDLY } from "../combat/constants.ts";
+import { creaturesNear, indexSpawns } from "./spawn.ts";
+import { openAuthDatabase, saveSessionKey } from "../db.ts";
+import { WorldCrypt } from "../crypto/world-crypt.ts";
+import { ByteWriter } from "../net/byte-buffer.ts";
+import { SpellStore } from "../spells/spell-info.ts";
+import { loadSpellState } from "../spells/persist.ts";
+import { ensureCharacterTables, loadCharacterKit } from "../characters/store.ts";
+import { itemGuidRaw } from "../items/equipment-sets.ts";
+import { CMSG_USE_ITEM, SMSG_SPELL_COOLDOWN } from "../items/use-item.ts";
+import { CMSG_CANCEL_CAST, CMSG_CAST_SPELL, SMSG_AURA_UPDATE, SMSG_LEARNED_SPELL, SMSG_PERIODICAURALOG, SMSG_SPELL_FAILURE, SMSG_SPELL_GO, SMSG_SPELL_START, SMSG_SPELLHEALLOG, SMSG_SPELLNONMELEEDAMAGELOG, TARGET_FLAG_UNIT, writeTargets } from "../spells/packets.ts";
+import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
+import { authSeed, CMSG_AUTH_SESSION, sessionDigest } from "./packets.ts";
+import { WorldSession } from "./session.ts";
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("known heal casts after its cast time and changes health", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 2050, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const spells = await SpellStore.load("data/dbc", null);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const session = new WorldSession(db, world, null, undefined, null, undefined, undefined, undefined, spells);
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  session.stats!.setMaxPower(0, 100);
+  session.stats!.setPower(0, 100);
+  session.stats!.setHealth(10);
+  received.length = 0;
+  const cast = new ByteWriter().writeU8(1).writeU32(2050).writeU8(0).writeU32(0).toUint8Array();
+  session.handle(CMSG_CAST_SPELL, cast).packets.forEach(decode);
+  expect(received).toContain(SMSG_SPELL_START);
+  expect(received).not.toContain(SMSG_SPELL_GO);
+  session.handle(CMSG_CANCEL_CAST, new ByteWriter().writeU8(2).writeU32(2050).toUint8Array()).packets.forEach(decode);
+  expect(received).toContain(SMSG_SPELL_FAILURE);
+  received.length = 0;
+  session.handle(CMSG_CAST_SPELL, cast).packets.forEach(decode);
+  expect(received).toContain(SMSG_SPELL_START);
+  session.handle(CMSG_CANCEL_CAST, new ByteWriter().writeU8(2).writeU32(2050).toUint8Array()).packets.forEach(decode);
+  session.update(1500);
+  expect(session.stats!.health).toBeLessThan(session.stats!.maxHealth);
+  received.length = 0;
+  session.handle(CMSG_CAST_SPELL, cast).packets.forEach(decode);
+  session.update(1499);
+  expect(received).not.toContain(SMSG_SPELL_GO);
+  session.update(1);
+  expect(received).toContain(SMSG_SPELL_GO);
+  expect(received).toContain(SMSG_SPELLHEALLOG);
+  expect(session.stats!.health).toBeGreaterThan(10);
+  session.disconnect();
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("learn-spell effect updates the spellbook and persists it", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 563, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const session = new WorldSession(db, null, null, undefined, null, undefined, undefined, undefined, await SpellStore.load("data/dbc", null));
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  session.handle(CMSG_CAST_SPELL, new ByteWriter().writeU8(1).writeU32(563).writeU8(0).writeU32(0).toUint8Array()).packets.forEach(decode);
+  session.update(3000);
+  expect(received).toContain(SMSG_LEARNED_SPELL);
+  session.disconnect();
+  expect(loadCharacterKit(db, 1).spells).toContain(8928);
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("percentage healing uses the target's maximum health", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 48982, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const session = new WorldSession(db, world, null, undefined, null, undefined, undefined, undefined, await SpellStore.load("data/dbc", null));
+  const client = new WorldCrypt(key, "client");
+  const decode = (packet: Uint8Array): void => { const header = packet.slice(0, 4); client.decryptHeader(header); };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  session.stats!.setMaxHealth(100);
+  session.stats!.setHealth(50);
+  session.handle(CMSG_CAST_SPELL, new ByteWriter().writeU8(1).writeU32(48982).writeU8(0).writeU32(0).toUint8Array()).packets.forEach(decode);
+  expect(session.stats!.health).toBe(60);
+  session.disconnect();
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("item spell heals and consumes its charge after casting", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO item_instance (guid, itemEntry, owner_guid, count, charges, enchantments) VALUES (42, 118, 1, 1, '-1 0 0 0 0 ', '')").run();
+  db.query("INSERT INTO character_inventory (guid, bag, slot, item) VALUES (1, 0, 23, 42)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const spells = await SpellStore.load("data/dbc", world.sqlite());
+  const session = new WorldSession(db, world, null, undefined, null, undefined, undefined, undefined, spells);
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  session.stats!.setHealth(10);
+  const use = new ByteWriter().writeU8(0).writeU8(23).writeU8(1).writeU32(439)
+    .writeU64(itemGuidRaw(42)).writeU32(0).writeU8(0).writeU32(0).toUint8Array();
+  session.handle(CMSG_USE_ITEM, use).packets.forEach(decode);
+  expect(received).toContain(SMSG_SPELL_START);
+  expect(received).toContain(SMSG_SPELL_GO);
+  expect(received).toContain(SMSG_SPELL_COOLDOWN);
+  expect(received).toContain(SMSG_SPELLHEALLOG);
+  expect(session.stats!.health).toBeGreaterThan(10);
+  expect(db.query("SELECT guid FROM item_instance WHERE guid = 42").get()).toBeNull();
+  session.disconnect();
+  expect(loadSpellState(db, 1).cooldowns).toEqual(expect.arrayContaining([expect.objectContaining({ spell: 439, item: 118, category: 4 })]));
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("Hearthstone waits for its cast and teleports to homebind", async () => {
+  const db = openAuthDatabase(":memory:");
+  ensureCharacterTables(db);
+  db.query("INSERT INTO character_homebind (guid,mapId,zoneId,posX,posY,posZ) VALUES (1,0,12,-8860,-120,83)").run();
+  db.query("INSERT INTO item_instance (guid, itemEntry, owner_guid, count, charges, enchantments) VALUES (42, 6948, 1, 1, '0 0 0 0 0 ', '')").run();
+  db.query("INSERT INTO character_inventory (guid, bag, slot, item) VALUES (1, 0, 23, 42)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const session = new WorldSession(db, world, null, undefined, null, undefined, undefined, undefined, await SpellStore.load("data/dbc", world.sqlite()));
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  const use = new ByteWriter().writeU8(0).writeU8(23).writeU8(1).writeU32(8690)
+    .writeU64(itemGuidRaw(42)).writeU32(0).writeU8(0).writeU32(0).toUint8Array();
+  session.handle(CMSG_USE_ITEM, use).packets.forEach(decode);
+  expect(received).toContain(SMSG_SPELL_START);
+  expect(received).not.toContain(SMSG_SPELL_GO);
+  session.update(9999);
+  expect(received).not.toContain(SMSG_SPELL_GO);
+  session.update(1);
+  expect(received).toContain(SMSG_SPELL_GO);
+  expect(received).toContain(SMSG_SPELL_COOLDOWN);
+  expect(db.query("SELECT guid FROM item_instance WHERE guid = 42").get()).not.toBeNull();
+  session.disconnect();
+  expect((db.query("SELECT position_x FROM characters WHERE guid = 1").get() as { position_x: number }).position_x).toBe(-8860);
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("Fireball damages a hostile creature and ticks its damage aura", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 133, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const spawns = indexSpawns(world);
+  const spells = await SpellStore.load("data/dbc", world.sqlite());
+  const session = new WorldSession(db, world, spawns, undefined, null, undefined, undefined, undefined, spells);
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  const combat = combatWorldFor(world, spawns, world.sqlite(), null);
+  const start = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
+  const player = { race: 1, classId: 1, factionTemplate: RACE_FACTION_TEMPLATE.get(1)!, reputation: () => null };
+  const target = creaturesNear(spawns, start, 200)
+    .map((spawn) => combat.infos.info(spawn.guid)!)
+    .filter((info) => info && info.level <= 3 && info.type !== 8 && info.aiName === ""
+      && combat.factions.creatureToPlayer(info.factionTemplate, player) < REP_FRIENDLY
+      && combat.factions.playerToCreature(player, info.factionTemplate) < REP_FRIENDLY)
+    .sort((left, right) => right.maxHealth - left.maxHealth)[0]!;
+  expect(target).toBeDefined();
+  const move = new ByteWriter().writeU8(1).writeU8(1).writeU32(0).writeU16(0).writeU32(1)
+    .writeF32(target.home.x - 3).writeF32(target.home.y).writeF32(target.home.z).writeF32(0).writeU32(0).toUint8Array();
+  session.handle(0x0ee, move).packets.forEach(decode);
+  session.stats!.setMaxPower(0, 100);
+  session.stats!.setPower(0, 100);
+  const before = target.maxHealth;
+  const cast = new ByteWriter().writeU8(1).writeU32(133).writeU8(0);
+  writeTargets(cast, { mask: TARGET_FLAG_UNIT, object: target.guid, item: 0n, source: null, dest: null, text: "" });
+  session.handle(CMSG_CAST_SPELL, cast.toUint8Array()).packets.forEach(decode);
+  session.update(1500);
+  expect(received).toContain(SMSG_SPELL_GO);
+  expect(received).toContain(SMSG_SPELLNONMELEEDAMAGELOG);
+  expect(combat.creature(target.spawnGuid)?.health).toBeLessThan(before);
+  expect(combat.creature(target.spawnGuid)?.auras?.size).toBe(1);
+  const afterHit = combat.creature(target.spawnGuid)!.health;
+  combat.update(Date.now() + 2000);
+  expect(combat.creature(target.spawnGuid)?.health).toBeLessThan(afterHit);
+  session.disconnect();
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("a triggered damage spell hits without a second cooldown or power cost", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 36342, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const spawns = indexSpawns(world);
+  const spells = await SpellStore.load("data/dbc", world.sqlite());
+  const session = new WorldSession(db, world, spawns, undefined, null, undefined, undefined, undefined, spells);
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  const combat = combatWorldFor(world, spawns, world.sqlite(), null);
+  const start = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
+  const player = { race: 1, classId: 1, factionTemplate: RACE_FACTION_TEMPLATE.get(1)!, reputation: () => null };
+  const target = creaturesNear(spawns, start, 200)
+    .map((spawn) => combat.infos.info(spawn.guid)!)
+    .filter((info) => info && info.level <= 3 && info.type !== 8 && info.aiName === ""
+      && combat.factions.creatureToPlayer(info.factionTemplate, player) < REP_FRIENDLY
+      && combat.factions.playerToCreature(player, info.factionTemplate) < REP_FRIENDLY)
+    .sort((left, right) => right.maxHealth - left.maxHealth)[0]!;
+  expect(target).toBeDefined();
+  const move = new ByteWriter().writeU8(1).writeU8(1).writeU32(0).writeU16(0).writeU32(1)
+    .writeF32(target.home.x - 3).writeF32(target.home.y).writeF32(target.home.z).writeF32(0).writeU32(0).toUint8Array();
+  session.handle(0x0ee, move).packets.forEach(decode);
+  received.length = 0;
+  const cast = new ByteWriter().writeU8(1).writeU32(36342).writeU8(0);
+  writeTargets(cast, { mask: TARGET_FLAG_UNIT, object: target.guid, item: 0n, source: null, dest: null, text: "" });
+  session.handle(CMSG_CAST_SPELL, cast.toUint8Array()).packets.forEach(decode);
+  expect(received.filter((opcode) => opcode === SMSG_SPELL_GO)).toHaveLength(2);
+  expect(received).toContain(SMSG_SPELLNONMELEEDAMAGELOG);
+  expect(combat.creature(target.spawnGuid)?.health).toBeLessThan(target.maxHealth);
+  session.disconnect();
+  expect(loadSpellState(db, 1).cooldowns.some((row) => row.spell === 36628)).toBe(false);
+  world.close();
+});
+
+test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()) || !(await Bun.file("data/world.sqlite").exists()))("Renew applies, heals on its periodic tick, and survives logout", async () => {
+  const db = openAuthDatabase(":memory:");
+  db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (1, 139, 1)").run();
+  const key = crypto.getRandomValues(new Uint8Array(40));
+  saveSessionKey(db, "TEST", key);
+  const world = new WorldData(new Database("data/world.sqlite", { readonly: true, strict: true }));
+  const session = new WorldSession(db, world, null, undefined, null, undefined, undefined, undefined, await SpellStore.load("data/dbc", null));
+  const client = new WorldCrypt(key, "client");
+  const received: number[] = [];
+  const decode = (packet: Uint8Array): void => {
+    const header = packet.slice(0, 4);
+    client.decryptHeader(header);
+    received.push(header[2]! | (header[3]! << 8));
+  };
+  session.attach(decode);
+  const seed = Uint8Array.of(1, 2, 3, 4);
+  const auth = new ByteWriter().writeU32(12340).writeU32(0).writeCString("TEST").writeU32(0).writeBytes(seed)
+    .writeU32(0).writeU32(0).writeU32(1).writeU32(0).writeU32(0)
+    .writeBytes(sessionDigest("TEST", seed, authSeed(session.greeting), key)).writeU32(0).toUint8Array();
+  session.handle(CMSG_AUTH_SESSION, auth).packets.forEach(decode);
+  session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array()).packets.forEach(decode);
+  session.stats!.setMaxPower(0, 100);
+  session.stats!.setPower(0, 100);
+  session.stats!.setHealth(10);
+  received.length = 0;
+  session.handle(CMSG_CAST_SPELL, new ByteWriter().writeU8(1).writeU32(139).writeU8(0).writeU32(0).toUint8Array()).packets.forEach(decode);
+  expect(received).toContain(SMSG_AURA_UPDATE);
+  session.update(3000);
+  expect(received).toContain(SMSG_PERIODICAURALOG);
+  expect(session.stats!.health).toBeGreaterThan(10);
+  session.disconnect();
+  expect(loadSpellState(db, 1).auras[0]).toMatchObject({ spell: 139, effectMask: 1, remainTime: 12000 });
+  world.close();
+});

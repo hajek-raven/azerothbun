@@ -4,7 +4,7 @@ Tento dokument popisuje, jak převedeme zbytek `azerothcore/` do `src/` jako nat
 
 ## Kde jsme
 
-Hotové je přihlášení (SRP6, realm list), výpis, vytvoření a smazání postavy, vstup do světa, pohyb hráče, viditelnost creatures, gameobjectů a hráčů, gossip, questy a import celého `db_world` do `data/world.sqlite`. To je asi 16,5 tisíce řádků TS.
+Hotové je přihlášení (SRP6, realm list), výpis, vytvoření a smazání postavy, vstup do světa, pohyb hráče, viditelnost creatures, gameobjectů a hráčů, gossip, questy a databáze AzerothCore v MySQL (`acore_auth`, `acore_characters`, `acore_world`) plněné portem `DBUpdater`. To je asi 16,5 tisíce řádků TS.
 
 Zbývá zhruba 700 tisíc řádků C++ (bez `deps/`). Hrubé rozdělení:
 
@@ -29,7 +29,7 @@ Každá C++ závislost má náhradu v Bunu, nebo ji napíšeme v TS. Žádné FF
 | C++ závislost | Náhrada |
 | --- | --- |
 | Boost.Asio, sockety, `WorldSocketMgr` | `Bun.listen` (už běží) |
-| MySQL, `DatabaseWorkerPool`, prepared statements | `bun:sqlite`, `db.prepare`, `db.transaction` |
+| MySQL, `DatabaseWorkerPool`, prepared statements | MySQL z `docker compose`, `Bun.SQL` + drizzle-orm (`drizzle-orm/bun-sql/mysql`), `db.transaction` |
 | OpenSSL (SRP6, ARC4, HMAC, SHA1) | `Bun.CryptoHasher` + vlastní ARC4 (už běží) |
 | zlib (komprese `SMSG_COMPRESSED_*`, addon info) | `Bun.deflateSync` / `Bun.inflateSync` |
 | Boost.Thread, `MapUpdater` vlákna | jedno vlákno a `World.update(diff)`; `Worker` až když to změříme |
@@ -53,7 +53,7 @@ src/
   math/          Vector3, Quat, AABox, BIH (z G3D a Collision)
   crypto/        už existuje
   net/           ByteBuffer, už existuje
-  database/      otevření tří SQLite, updater, schéma z MySQL dumpů
+  database/      tři MySQL pooly, DBUpdater, generované drizzle schéma, WorldTables
   shared/        SharedDefines, DBC formáty a struktury, Realms
   game/
     accounts/ achievements/ ai/ auction/ battlegrounds/ battlefield/
@@ -74,9 +74,9 @@ Stávající `src/world/`, `src/characters/` a `src/data/` postupně přestěhuj
 
 ### Klíčová rozhodnutí
 
-- **Tři databáze** jako v AzerothCore: `data/auth.sqlite`, `data/characters.sqlite`, `data/world.sqlite`. Tabulky `characters` a `character_*` se přesunou z `auth.sqlite` do `characters.sqlite`.
-- **Schéma se generuje z dumpů.** `src/data/mysql-schema.ts` už umí převést `CREATE TABLE` z MySQL. Stejně naplníme `db_auth` a `db_characters` (108 tabulek) z `sql/base/` a pak přehrajeme `data/sql/updates/`. Ruční `CREATE TABLE` v kódu zmizí.
-- **Jedno vlákno, pevný tick.** `World.update(diff)` volá `MapMgr.update(diff)` a ten volá mapy, gridy, objekty, sessions a eventy ve stejném pořadí jako `World::Update` a `Map::Update`. Asynchronní dotazy z AC (`AsyncQuery`, `QueryCallback`) se v SQLite provedou synchronně, ale ve stejném místě toku.
+- **Tři databáze** jako v AzerothCore: `acore_auth`, `acore_characters`, `acore_world` v MySQL. Schéma i data dělá `DBUpdater` z `sql/base/` a `data/sql/updates/`; drizzle schéma v `src/database/schema/` se generuje z živé DB.
+- **Schéma se nepíše ručně.** Dumpy a updaty se aplikují do MySQL beze změny a `bun run gen:db-schema` z nich vytáhne drizzle tabulky s AC jmény sloupců. V `src/` není žádné `CREATE TABLE`.
+- **Jedno vlákno, pevný tick.** `World.update(diff)` volá `MapMgr.update(diff)` a ten volá mapy, gridy, objekty, sessions a eventy ve stejném pořadí jako `World::Update` a `Map::Update`. `acore_world` se načte při startu do `WorldTables` a čte se synchronně jako cache `ObjectMgr`. Dotazy na `acore_auth` a `acore_characters` jsou `await`; zápisy z ticku jdou přes `executeAsync` do poolu s jedním spojením, takže zůstává pořadí jako u `CharacterDatabase.Execute`.
 - **Třídy 1:1.** `Object → WorldObject → Unit → Player/Creature`, `GameObject`, `Item → Bag`. Jména metod zůstanou jako v C++ (`Unit.DealDamage` se v TS jmenuje `dealDamage`). Update fieldy jsou jedno pole `Uint32Array` podle `UpdateFields.h`, stejně jako `m_uint32Values`.
 - **ObjectGuid** je hodnota ze dvou `uint32` (high a low) s pomocnými funkcemi z `ObjectGuid.h`. `bigint` jen tam, kde se 64bitová hodnota ukládá celá.
 - **Enumy** z `SharedDefines.h`, `UnitDefines.h`, `SpellDefines.h` a dalších se převedou jako `const enum`, nebo jako objekty `as const`. Každý `switch` nad nimi končí kontrolou `never`.
@@ -90,7 +90,7 @@ Každé téma (například „Loot“ nebo „Guildy“) se dělá stejně:
 2. Sepsat tabulky, které systém čte a zapisuje, v `db_world`, `db_characters` i `db_auth`, včetně pozdějších `ALTER` v `updates/`.
 3. Převést loader (`ObjectMgr::Load*`, `*Mgr::Load*`) a zapojit ho do startu ve stejném pořadí jako `World::SetInitialWorldSettings`.
 4. Převést runtime chování a handlery všech opcodů systému.
-5. Napsat testy vedle kódu (`*.test.ts`): parsování packetů bajt po bajtu proti známým dumpům a logiku proti malé SQLite v paměti.
+5. Napsat testy vedle kódu (`*.test.ts`): parsování packetů bajt po bajtu proti známým dumpům a logiku proti `WorldTables.fromRows` / `worldFromSql` a proti testovacím `acore_test_*` databázím v MySQL.
 6. Ověřit v klientu 3.3.5a.
 7. Odškrtnout řádky v `docs/status.md` a aktualizovat příslušný dokument v `docs/`.
 
@@ -105,8 +105,8 @@ Bez toho nejde nic dalšího.
 - `Configuration/` a `worldserver.conf.dist` / `authserver.conf.dist`: loader konfigurace (soubor + proměnné prostředí z `.env`), všechny klíče z `WorldConfig.cpp` s výchozími hodnotami.
 - `Time/`: `GameTime`, `UpdateTime`; `World.update(diff)` jako hlavní smyčka.
 - `common/`: `EventProcessor`, `EventMap`, `TaskScheduler`, `Timer`, `Random` (SFMT), `Util`.
-- `database/`: tři SQLite soubory, generátor schématu z `sql/base/` pro všechny tři databáze, přehrání `updates/`, `updates` a `updates_include` tabulky.
-- Přesun postav do `characters.sqlite` s plným `db_characters`.
+- `database/`: hotovo — tři MySQL pooly, port `DBUpdater` (`updates`, `updates_include`), generované drizzle schéma. Zbývá port prepared statements z `*Database.cpp`.
+- Postavy jsou v `acore_characters` s plným `db_characters` (hotovo).
 - `DataStores/` a `shared/DataStores`: všechny DBC z `DBCStores.cpp` a formáty z `DBCfmt.h`, ne jen sedm současných. Doplnit `sql/base/db_world` tabulky `*_dbc`, které DBC přepisují.
 - `SharedDefines`, `ObjectGuid`, `Position`, `UpdateFields`.
 - `World`: `SetInitialWorldSettings` jako jedna startovací sekvence, `WorldSessionMgr`, fronta přihlášení, kick, shutdown.

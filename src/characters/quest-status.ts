@@ -1,4 +1,13 @@
-import type { Database } from "bun:sqlite";
+import { eq } from "drizzle-orm";
+import type { Db } from "../database/database.ts";
+import {
+  character_queststatus,
+  character_queststatus_daily,
+  character_queststatus_monthly,
+  character_queststatus_rewarded,
+  character_queststatus_seasonal,
+  character_queststatus_weekly,
+} from "../database/schema/characters.ts";
 
 export type ActiveQuestRow = {
   quest: number;
@@ -27,157 +36,78 @@ export type QuestStatusState = {
   seasonal: { quest: number; event: number }[];
 };
 
-export function ensureQuestStatusTables(db: Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS character_queststatus (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      status INTEGER NOT NULL DEFAULT 0,
-      explored INTEGER NOT NULL DEFAULT 0,
-      timer INTEGER NOT NULL DEFAULT 0,
-      mobcount1 INTEGER NOT NULL DEFAULT 0,
-      mobcount2 INTEGER NOT NULL DEFAULT 0,
-      mobcount3 INTEGER NOT NULL DEFAULT 0,
-      mobcount4 INTEGER NOT NULL DEFAULT 0,
-      itemcount1 INTEGER NOT NULL DEFAULT 0,
-      itemcount2 INTEGER NOT NULL DEFAULT 0,
-      itemcount3 INTEGER NOT NULL DEFAULT 0,
-      itemcount4 INTEGER NOT NULL DEFAULT 0,
-      itemcount5 INTEGER NOT NULL DEFAULT 0,
-      itemcount6 INTEGER NOT NULL DEFAULT 0,
-      playercount INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, quest)
-    );
-    CREATE TABLE IF NOT EXISTS character_queststatus_rewarded (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      active INTEGER NOT NULL DEFAULT 1,
-      PRIMARY KEY (guid, quest)
-    );
-    CREATE TABLE IF NOT EXISTS character_queststatus_daily (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      time INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, quest)
-    );
-    CREATE TABLE IF NOT EXISTS character_queststatus_weekly (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, quest)
-    );
-    CREATE TABLE IF NOT EXISTS character_queststatus_monthly (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, quest)
-    );
-    CREATE TABLE IF NOT EXISTS character_queststatus_seasonal (
-      guid INTEGER NOT NULL DEFAULT 0,
-      quest INTEGER NOT NULL DEFAULT 0,
-      event INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, quest)
-    );
-  `);
-}
+const ACTIVE_COLUMNS = {
+  quest: character_queststatus.quest,
+  status: character_queststatus.status,
+  explored: character_queststatus.explored,
+  timer: character_queststatus.timer,
+  mobcount1: character_queststatus.mobcount1,
+  mobcount2: character_queststatus.mobcount2,
+  mobcount3: character_queststatus.mobcount3,
+  mobcount4: character_queststatus.mobcount4,
+  itemcount1: character_queststatus.itemcount1,
+  itemcount2: character_queststatus.itemcount2,
+  itemcount3: character_queststatus.itemcount3,
+  itemcount4: character_queststatus.itemcount4,
+  itemcount5: character_queststatus.itemcount5,
+  itemcount6: character_queststatus.itemcount6,
+  playercount: character_queststatus.playercount,
+};
 
-export function loadQuestStatus(db: Database, guid: number): QuestStatusState {
-  ensureQuestStatusTables(db);
-
-  const active = db
-    .query(
-      `SELECT quest, status, explored, timer,
-              mobcount1, mobcount2, mobcount3, mobcount4,
-              itemcount1, itemcount2, itemcount3, itemcount4, itemcount5, itemcount6,
-              playercount
-       FROM character_queststatus WHERE guid = $guid`,
-    )
-    .all({ guid }) as ActiveQuestRow[];
-
-  const rewarded = db
-    .query("SELECT quest, active FROM character_queststatus_rewarded WHERE guid = $guid")
-    .all({ guid }) as { quest: number; active: number }[];
-
-  const daily = db
-    .query("SELECT quest, time FROM character_queststatus_daily WHERE guid = $guid")
-    .all({ guid }) as { quest: number; time: number }[];
-
-  const weekly = db
-    .query("SELECT quest FROM character_queststatus_weekly WHERE guid = $guid")
-    .all({ guid }) as { quest: number }[];
-
-  const monthly = db
-    .query("SELECT quest FROM character_queststatus_monthly WHERE guid = $guid")
-    .all({ guid }) as { quest: number }[];
-
-  const seasonal = db
-    .query("SELECT quest, event FROM character_queststatus_seasonal WHERE guid = $guid")
-    .all({ guid }) as { quest: number; event: number }[];
+export async function loadQuestStatus(db: Db, guid: number): Promise<QuestStatusState> {
+  const active: ActiveQuestRow[] = await db.select(ACTIVE_COLUMNS).from(character_queststatus).where(eq(character_queststatus.guid, guid));
+  const rewarded = await db
+    .select({ quest: character_queststatus_rewarded.quest, active: character_queststatus_rewarded.active })
+    .from(character_queststatus_rewarded)
+    .where(eq(character_queststatus_rewarded.guid, guid));
+  const daily = await db
+    .select({ quest: character_queststatus_daily.quest, time: character_queststatus_daily.time })
+    .from(character_queststatus_daily)
+    .where(eq(character_queststatus_daily.guid, guid));
+  const weekly = await db
+    .select({ quest: character_queststatus_weekly.quest })
+    .from(character_queststatus_weekly)
+    .where(eq(character_queststatus_weekly.guid, guid));
+  const monthly = await db
+    .select({ quest: character_queststatus_monthly.quest })
+    .from(character_queststatus_monthly)
+    .where(eq(character_queststatus_monthly.guid, guid));
+  const seasonal = await db
+    .select({ quest: character_queststatus_seasonal.quest, event: character_queststatus_seasonal.event })
+    .from(character_queststatus_seasonal)
+    .where(eq(character_queststatus_seasonal.guid, guid));
 
   return { active, rewarded, daily, weekly, monthly, seasonal };
 }
 
-export function saveQuestStatus(db: Database, guid: number, state: QuestStatusState): void {
-  ensureQuestStatusTables(db);
+export async function saveQuestStatus(db: Db, guid: number, state: QuestStatusState): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.delete(character_queststatus).where(eq(character_queststatus.guid, guid));
+    await tx.delete(character_queststatus_rewarded).where(eq(character_queststatus_rewarded.guid, guid));
+    await tx.delete(character_queststatus_daily).where(eq(character_queststatus_daily.guid, guid));
+    await tx.delete(character_queststatus_weekly).where(eq(character_queststatus_weekly.guid, guid));
+    await tx.delete(character_queststatus_monthly).where(eq(character_queststatus_monthly.guid, guid));
+    await tx.delete(character_queststatus_seasonal).where(eq(character_queststatus_seasonal.guid, guid));
 
-  const save = db.transaction(() => {
-    db.query("DELETE FROM character_queststatus WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_queststatus_rewarded WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_queststatus_daily WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_queststatus_weekly WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_queststatus_monthly WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_queststatus_seasonal WHERE guid = $guid").run({ guid });
-
-    const insertActive = db.query(
-      `INSERT INTO character_queststatus (
-         guid, quest, status, explored, timer,
-         mobcount1, mobcount2, mobcount3, mobcount4,
-         itemcount1, itemcount2, itemcount3, itemcount4, itemcount5, itemcount6,
-         playercount
-       ) VALUES (
-         $guid, $quest, $status, $explored, $timer,
-         $mobcount1, $mobcount2, $mobcount3, $mobcount4,
-         $itemcount1, $itemcount2, $itemcount3, $itemcount4, $itemcount5, $itemcount6,
-         $playercount
-       )`,
-    );
-    for (const row of state.active) {
-      insertActive.run({ guid, ...row });
+    if (state.active.length > 0) {
+      await tx.insert(character_queststatus).values(state.active.map((row) => ({ guid, ...row })));
     }
-
-    const insertRewarded = db.query(
-      "INSERT INTO character_queststatus_rewarded (guid, quest, active) VALUES ($guid, $quest, $active)",
-    );
-    for (const row of state.rewarded) {
-      insertRewarded.run({ guid, quest: row.quest, active: row.active });
+    if (state.rewarded.length > 0) {
+      await tx.insert(character_queststatus_rewarded).values(state.rewarded.map((row) => ({ guid, quest: row.quest, active: row.active })));
     }
-
-    const insertDaily = db.query(
-      "INSERT INTO character_queststatus_daily (guid, quest, time) VALUES ($guid, $quest, $time)",
-    );
-    for (const row of state.daily) {
-      insertDaily.run({ guid, quest: row.quest, time: row.time });
+    if (state.daily.length > 0) {
+      await tx.insert(character_queststatus_daily).values(state.daily.map((row) => ({ guid, quest: row.quest, time: row.time })));
     }
-
-    const insertWeekly = db.query(
-      "INSERT INTO character_queststatus_weekly (guid, quest) VALUES ($guid, $quest)",
-    );
-    for (const row of state.weekly) {
-      insertWeekly.run({ guid, quest: row.quest });
+    if (state.weekly.length > 0) {
+      await tx.insert(character_queststatus_weekly).values(state.weekly.map((row) => ({ guid, quest: row.quest })));
     }
-
-    const insertMonthly = db.query(
-      "INSERT INTO character_queststatus_monthly (guid, quest) VALUES ($guid, $quest)",
-    );
-    for (const row of state.monthly) {
-      insertMonthly.run({ guid, quest: row.quest });
+    if (state.monthly.length > 0) {
+      await tx.insert(character_queststatus_monthly).values(state.monthly.map((row) => ({ guid, quest: row.quest })));
     }
-
-    const insertSeasonal = db.query(
-      "INSERT INTO character_queststatus_seasonal (guid, quest, event) VALUES ($guid, $quest, $event)",
-    );
-    for (const row of state.seasonal) {
-      insertSeasonal.run({ guid, quest: row.quest, event: row.event });
+    if (state.seasonal.length > 0) {
+      await tx
+        .insert(character_queststatus_seasonal)
+        .values(state.seasonal.map((row) => ({ guid, quest: row.quest, event: row.event })));
     }
   });
-
-  save();
 }

@@ -26,7 +26,7 @@ test("a flying movement packet still yields the position", () => {
   const info = readMoveInfo("move", payload);
   expect(info?.x).toBeCloseTo(10);
   expect(info?.z).toBeCloseTo(30);
-  expect(info?.flags & 0x02000000).toBe(0);
+  expect(info!.flags & 0x02000000).toBe(0);
 });
 
 test("falls shorter than 13.48 yards deal no damage", () => {

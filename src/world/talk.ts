@@ -1,4 +1,6 @@
-import { Database } from "bun:sqlite";
+import type { Db } from "../database/database.ts";
+import { WorldTables } from "../database/world-tables.ts";
+import { giveXp } from "../characters/experience.ts";
 import type { CharacterLoginKit } from "../characters/store.ts";
 import { creatureFlags, type WorldData } from "../data/world.ts";
 import type { Character } from "../db.ts";
@@ -125,7 +127,7 @@ export function talkDataFor(world: WorldData): TalkData {
   if (found) {
     return found;
   }
-  const db = typeof world.database === "function" ? world.database() : new Database(":memory:");
+  const db = typeof world.tables === "function" ? world.tables() : WorldTables.fromRows();
   const created = { gossip: new GossipCatalog(db), quests: new QuestCatalog(db) };
   sharedTalk.set(world, created);
   return created;
@@ -142,6 +144,11 @@ type OpenTarget = {
 
 export class Talk {
   readonly quests: QuestLog;
+  /**
+   * `Player::GiveXP(xp, nullptr)` from `RewardQuest`. The session sets it once the player's stats are loaded;
+   * the packets (SMSG_LOG_XPGAIN, SMSG_LEVELUP_INFO) go out before SMSG_QUESTGIVER_QUEST_COMPLETE.
+   */
+  giveXp: ((amount: number) => TalkPacket[]) | null = null;
   private target: OpenTarget | null = null;
   private menuId = 0;
   private divider = 0n;
@@ -175,13 +182,13 @@ export class Talk {
     return this.quests.source();
   }
 
-  login(db: Database, player: Character): void {
+  async login(db: Db, player: Character): Promise<void> {
     this.syncSpeaker(player);
-    this.quests.load(db, player.guid);
+    await this.quests.load(db, player.guid);
   }
 
-  save(db: Database, guid: number): void {
-    this.quests.save(db, guid);
+  save(db: Db, guid: number): Promise<void> {
+    return this.quests.save(db, guid);
   }
 
   loginUpdate(player: Character): TalkPacket[] {
@@ -726,7 +733,10 @@ export class Talk {
     if (!reward) {
       return [packet(SMSG_GOSSIP_COMPLETE, "SMSG_GOSSIP_COMPLETE", gossipComplete())];
     }
-    applyXp(player, reward.xp);
+    const xpPackets = this.giveXp ? this.giveXp(reward.xp) : [];
+    if (!this.giveXp) {
+      applyXp(player, reward.xp, worldDatabase(this.world));
+    }
     player.money = Math.max(0, player.money + reward.money);
     if (reward.spell > 0 && !kit.spells.includes(reward.spell)) {
       kit.spells.push(reward.spell);
@@ -747,6 +757,7 @@ export class Talk {
       log("world", `quest ${questId} item reward ${names.join(", ")} waits for bags`);
     }
     const packets = [
+      ...xpPackets,
       packet(
         SMSG_QUESTGIVER_QUEST_COMPLETE,
         "SMSG_QUESTGIVER_QUEST_COMPLETE",
@@ -966,7 +977,7 @@ function speakerOf(player: Character): Speaker {
   };
 }
 
-function fullQuestLog(log: QuestLog): { index: number; value: number }[] {
+export function fullQuestLog(log: QuestLog): { index: number; value: number }[] {
   return questLogValues(log.slotIds(), log.active());
 }
 
@@ -989,10 +1000,36 @@ function nextXp(level: number): number {
   return XP_TO_NEXT[level] ?? 0;
 }
 
-function applyXp(player: Character, amount: number): void {
+function worldDatabase(world: WorldData): WorldTables | null {
+  return typeof world.tables === "function" ? world.tables() : null;
+}
+
+function applyXp(player: Character, amount: number, world: WorldTables | null): void {
   if (amount <= 0) {
     return;
   }
+  if (!world) {
+    applyXpTable(player, amount);
+    return;
+  }
+  try {
+    const gained = giveXp({
+      world,
+      level: player.level,
+      xp: player.xp,
+      restBonus: player.rest_bonus,
+      amount,
+      rates: { rest: false },
+    });
+    player.level = gained.level;
+    player.xp = gained.xp;
+    player.rest_bonus = gained.restBonus;
+  } catch {
+    applyXpTable(player, amount);
+  }
+}
+
+function applyXpTable(player: Character, amount: number): void {
   player.xp += amount;
   while (player.level < XP_TO_NEXT.length - 1 && player.xp >= (XP_TO_NEXT[player.level] ?? Number.MAX_SAFE_INTEGER)) {
     player.xp -= XP_TO_NEXT[player.level] ?? 0;

@@ -1,4 +1,5 @@
-import { Database } from "bun:sqlite";
+import { worldFromSql } from "../database/test-world.ts";
+import { WorldTables } from "../database/world-tables.ts";
 import { expect, test } from "bun:test";
 import { ByteReader } from "../net/byte-buffer.ts";
 import {
@@ -10,9 +11,9 @@ import {
   type Speaker,
 } from "./gossip.ts";
 
-function openGossipDb(): Database {
-  const db = new Database(":memory:", { strict: true });
-  db.run(`
+function openGossipDb(): WorldTables {
+  const db = WorldTables.fromRows();
+  worldFromSql(`
     CREATE TABLE gossip_menu (
       MenuID INTEGER NOT NULL DEFAULT 0,
       TextID INTEGER NOT NULL DEFAULT 0,
@@ -102,7 +103,7 @@ function openGossipDb(): Database {
       ConditionValue3 INTEGER NOT NULL DEFAULT 0,
       NegativeCondition INTEGER NOT NULL DEFAULT 0
     );
-  `);
+  `, db);
   return db;
 }
 
@@ -186,13 +187,11 @@ test("npc text fallback for missing id", () => {
 
 test("menu text id skips QUESTREWARDED failure and uses next row", () => {
   const db = openGossipDb();
-  db.run(`INSERT INTO gossip_menu (MenuID, TextID) VALUES (10, 100), (10, 200)`);
-  db.run(
-    `INSERT INTO conditions
+  worldFromSql(`INSERT INTO gossip_menu (MenuID, TextID) VALUES (10, 100), (10, 200)`, db);
+  worldFromSql(`INSERT INTO conditions
       (SourceTypeOrReferenceId, SourceGroup, SourceEntry, ElseGroup, ConditionTypeOrReference,
        ConditionValue1, ConditionValue2, ConditionValue3, NegativeCondition)
-     VALUES (14, 10, 100, 0, 8, 500, 0, 0, 0)`,
-  );
+     VALUES (14, 10, 100, 0, 8, 500, 0, 0, 0)`, db);
   const catalog = new GossipCatalog(db);
   const textId = catalog.textId(10, speaker, questsWith());
   expect(textId).toBe(200);
@@ -200,12 +199,10 @@ test("menu text id skips QUESTREWARDED failure and uses next row", () => {
 
 test("option hidden when OptionNpcFlag is vendor and npc flags are gossip only", () => {
   const db = openGossipDb();
-  db.run(
-    `INSERT INTO gossip_menu_option
+  worldFromSql(`INSERT INTO gossip_menu_option
       (MenuID, OptionID, OptionIcon, OptionText, OptionBroadcastTextID, OptionType, OptionNpcFlag,
        ActionMenuID, ActionPoiID, BoxCoded, BoxMoney, BoxText, BoxBroadcastTextID)
-     VALUES (1, 0, 1, 'Vendor', 0, 3, 128, 0, 0, 0, 0, '', 0)`,
-  );
+     VALUES (1, 0, 1, 'Vendor', 0, 3, 128, 0, 0, 0, 0, '', 0)`, db);
   const catalog = new GossipCatalog(db);
   const options = catalog.options(1, 1, speaker, questsWith());
   expect(options).toHaveLength(0);
@@ -213,12 +210,10 @@ test("option hidden when OptionNpcFlag is vendor and npc flags are gossip only",
 
 test("option shown when flags include vendor", () => {
   const db = openGossipDb();
-  db.run(
-    `INSERT INTO gossip_menu_option
+  worldFromSql(`INSERT INTO gossip_menu_option
       (MenuID, OptionID, OptionIcon, OptionText, OptionBroadcastTextID, OptionType, OptionNpcFlag,
        ActionMenuID, ActionPoiID, BoxCoded, BoxMoney, BoxText, BoxBroadcastTextID)
-     VALUES (1, 0, 1, 'Vendor', 0, 3, 128, 0, 0, 0, 0, '', 0)`,
-  );
+     VALUES (1, 0, 1, 'Vendor', 0, 3, 128, 0, 0, 0, 0, '', 0)`, db);
   const catalog = new GossipCatalog(db);
   const options = catalog.options(1, 0x80 | 1, speaker, questsWith());
   expect(options).toHaveLength(1);
@@ -227,18 +222,14 @@ test("option shown when flags include vendor", () => {
 
 test("quest taken condition hides an option", () => {
   const db = openGossipDb();
-  db.run(
-    `INSERT INTO gossip_menu_option
+  worldFromSql(`INSERT INTO gossip_menu_option
       (MenuID, OptionID, OptionIcon, OptionText, OptionBroadcastTextID, OptionType, OptionNpcFlag,
        ActionMenuID, ActionPoiID, BoxCoded, BoxMoney, BoxText, BoxBroadcastTextID)
-     VALUES (2, 0, 0, 'Talk', 0, 1, 1, 0, 0, 0, 0, '', 0)`,
-  );
-  db.run(
-    `INSERT INTO conditions
+     VALUES (2, 0, 0, 'Talk', 0, 1, 1, 0, 0, 0, 0, '', 0)`, db);
+  worldFromSql(`INSERT INTO conditions
       (SourceTypeOrReferenceId, SourceGroup, SourceEntry, ElseGroup, ConditionTypeOrReference,
        ConditionValue1, ConditionValue2, ConditionValue3, NegativeCondition)
-     VALUES (15, 2, 0, 0, 9, 77, 0, 0, 0)`,
-  );
+     VALUES (15, 2, 0, 0, 9, 77, 0, 0, 0)`, db);
   const catalog = new GossipCatalog(db);
   const hidden = catalog.options(2, 1, speaker, questsWith());
   expect(hidden).toHaveLength(0);

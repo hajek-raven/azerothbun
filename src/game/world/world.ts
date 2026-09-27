@@ -47,6 +47,8 @@ export class World {
   private shutdownReason = "";
   private activeSessions = 0;
   private queuedSessions = 0;
+  /** `WorldSessionMgr::UpdateSessions` — the world server registers its sessions here. */
+  private sessionUpdate: ((diff: number) => void) | null = null;
   loopCounter = 0;
 
   constructor(
@@ -97,6 +99,10 @@ export class World {
     return this.activeSessions;
   }
 
+  setSessionUpdate(update: ((diff: number) => void) | null): void {
+    this.sessionUpdate = update;
+  }
+
   getActiveAndQueuedSessionCount(): number {
     return this.activeSessions + this.queuedSessions;
   }
@@ -117,6 +123,8 @@ export class World {
         timer.setCurrent(0);
       }
     }
+
+    this.sessionUpdate?.(diff);
 
     if (this.timer(WorldTimer.WUPDATE_5_SECS).passed()) {
       this.timer(WorldTimer.WUPDATE_5_SECS).reset();

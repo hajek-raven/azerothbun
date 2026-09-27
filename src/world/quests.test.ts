@@ -1,4 +1,12 @@
-import { Database } from "bun:sqlite";
+import { testDatabase } from "../database/test-db.ts";
+import {
+  creature_questender,
+  creature_queststarter,
+  quest_template,
+  quest_template_addon,
+} from "../database/schema/world.ts";
+import { worldFromSql } from "../database/test-world.ts";
+import { WorldTables } from "../database/world-tables.ts";
 import { describe, expect, test } from "bun:test";
 import { ByteReader } from "../net/byte-buffer.ts";
 import {
@@ -13,126 +21,35 @@ import {
   QuestLog,
 } from "./quests.ts";
 
-function openWorldDb(): Database {
-  const db = new Database(":memory:", { strict: true });
-  db.exec(`
-    CREATE TABLE quest_template (
-      ID INTEGER PRIMARY KEY,
-      QuestType INTEGER NOT NULL DEFAULT 2,
-      QuestLevel INTEGER NOT NULL DEFAULT 1,
-      MinLevel INTEGER NOT NULL DEFAULT 0,
-      QuestSortID INTEGER NOT NULL DEFAULT 0,
-      QuestInfoID INTEGER NOT NULL DEFAULT 0,
-      SuggestedGroupNum INTEGER NOT NULL DEFAULT 0,
-      RequiredFactionId1 INTEGER NOT NULL DEFAULT 0,
-      RequiredFactionId2 INTEGER NOT NULL DEFAULT 0,
-      RequiredFactionValue1 INTEGER NOT NULL DEFAULT 0,
-      RequiredFactionValue2 INTEGER NOT NULL DEFAULT 0,
-      RewardNextQuest INTEGER NOT NULL DEFAULT 0,
-      RewardXPDifficulty INTEGER NOT NULL DEFAULT 0,
-      RewardMoney INTEGER NOT NULL DEFAULT 0,
-      RewardMoneyDifficulty INTEGER NOT NULL DEFAULT 0,
-      RewardDisplaySpell INTEGER NOT NULL DEFAULT 0,
-      RewardSpell INTEGER NOT NULL DEFAULT 0,
-      RewardHonor INTEGER NOT NULL DEFAULT 0,
-      RewardKillHonor REAL NOT NULL DEFAULT 0,
-      StartItem INTEGER NOT NULL DEFAULT 0,
-      Flags INTEGER NOT NULL DEFAULT 0,
-      RequiredPlayerKills INTEGER NOT NULL DEFAULT 0,
-      RewardItem1 INTEGER NOT NULL DEFAULT 0, RewardAmount1 INTEGER NOT NULL DEFAULT 0,
-      RewardItem2 INTEGER NOT NULL DEFAULT 0, RewardAmount2 INTEGER NOT NULL DEFAULT 0,
-      RewardItem3 INTEGER NOT NULL DEFAULT 0, RewardAmount3 INTEGER NOT NULL DEFAULT 0,
-      RewardItem4 INTEGER NOT NULL DEFAULT 0, RewardAmount4 INTEGER NOT NULL DEFAULT 0,
-      ItemDrop1 INTEGER NOT NULL DEFAULT 0, ItemDropQuantity1 INTEGER NOT NULL DEFAULT 0,
-      ItemDrop2 INTEGER NOT NULL DEFAULT 0, ItemDropQuantity2 INTEGER NOT NULL DEFAULT 0,
-      ItemDrop3 INTEGER NOT NULL DEFAULT 0, ItemDropQuantity3 INTEGER NOT NULL DEFAULT 0,
-      ItemDrop4 INTEGER NOT NULL DEFAULT 0, ItemDropQuantity4 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID1 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity1 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID2 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity2 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID3 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity3 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID4 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity4 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID5 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity5 INTEGER NOT NULL DEFAULT 0,
-      RewardChoiceItemID6 INTEGER NOT NULL DEFAULT 0, RewardChoiceItemQuantity6 INTEGER NOT NULL DEFAULT 0,
-      POIContinent INTEGER NOT NULL DEFAULT 0, POIx REAL NOT NULL DEFAULT 0, POIy REAL NOT NULL DEFAULT 0, POIPriority INTEGER NOT NULL DEFAULT 0,
-      RewardTitle INTEGER NOT NULL DEFAULT 0, RewardTalents INTEGER NOT NULL DEFAULT 0, RewardArenaPoints INTEGER NOT NULL DEFAULT 0,
-      RewardFactionID1 INTEGER NOT NULL DEFAULT 0, RewardFactionValue1 INTEGER NOT NULL DEFAULT 0, RewardFactionOverride1 INTEGER NOT NULL DEFAULT 0,
-      RewardFactionID2 INTEGER NOT NULL DEFAULT 0, RewardFactionValue2 INTEGER NOT NULL DEFAULT 0, RewardFactionOverride2 INTEGER NOT NULL DEFAULT 0,
-      RewardFactionID3 INTEGER NOT NULL DEFAULT 0, RewardFactionValue3 INTEGER NOT NULL DEFAULT 0, RewardFactionOverride3 INTEGER NOT NULL DEFAULT 0,
-      RewardFactionID4 INTEGER NOT NULL DEFAULT 0, RewardFactionValue4 INTEGER NOT NULL DEFAULT 0, RewardFactionOverride4 INTEGER NOT NULL DEFAULT 0,
-      RewardFactionID5 INTEGER NOT NULL DEFAULT 0, RewardFactionValue5 INTEGER NOT NULL DEFAULT 0, RewardFactionOverride5 INTEGER NOT NULL DEFAULT 0,
-      TimeAllowed INTEGER NOT NULL DEFAULT 0, AllowableRaces INTEGER NOT NULL DEFAULT 0,
-      LogTitle TEXT, LogDescription TEXT, QuestDescription TEXT, AreaDescription TEXT, QuestCompletionLog TEXT,
-      RequiredNpcOrGo1 INTEGER NOT NULL DEFAULT 0, RequiredNpcOrGo2 INTEGER NOT NULL DEFAULT 0,
-      RequiredNpcOrGo3 INTEGER NOT NULL DEFAULT 0, RequiredNpcOrGo4 INTEGER NOT NULL DEFAULT 0,
-      RequiredNpcOrGoCount1 INTEGER NOT NULL DEFAULT 0, RequiredNpcOrGoCount2 INTEGER NOT NULL DEFAULT 0,
-      RequiredNpcOrGoCount3 INTEGER NOT NULL DEFAULT 0, RequiredNpcOrGoCount4 INTEGER NOT NULL DEFAULT 0,
-      RequiredItemId1 INTEGER NOT NULL DEFAULT 0, RequiredItemId2 INTEGER NOT NULL DEFAULT 0, RequiredItemId3 INTEGER NOT NULL DEFAULT 0,
-      RequiredItemId4 INTEGER NOT NULL DEFAULT 0, RequiredItemId5 INTEGER NOT NULL DEFAULT 0, RequiredItemId6 INTEGER NOT NULL DEFAULT 0,
-      RequiredItemCount1 INTEGER NOT NULL DEFAULT 0, RequiredItemCount2 INTEGER NOT NULL DEFAULT 0, RequiredItemCount3 INTEGER NOT NULL DEFAULT 0,
-      RequiredItemCount4 INTEGER NOT NULL DEFAULT 0, RequiredItemCount5 INTEGER NOT NULL DEFAULT 0, RequiredItemCount6 INTEGER NOT NULL DEFAULT 0,
-      ObjectiveText1 TEXT, ObjectiveText2 TEXT, ObjectiveText3 TEXT, ObjectiveText4 TEXT
-    );
-    CREATE TABLE quest_template_addon (
-      ID INTEGER PRIMARY KEY,
-      MaxLevel INTEGER NOT NULL DEFAULT 0,
-      AllowableClasses INTEGER NOT NULL DEFAULT 0,
-      PrevQuestID INTEGER NOT NULL DEFAULT 0,
-      NextQuestID INTEGER NOT NULL DEFAULT 0,
-      ExclusiveGroup INTEGER NOT NULL DEFAULT 0,
-      SpecialFlags INTEGER NOT NULL DEFAULT 0,
-      ProvidedItemCount INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE creature_queststarter (id INTEGER NOT NULL, quest INTEGER NOT NULL);
-    CREATE TABLE creature_questender (id INTEGER NOT NULL, quest INTEGER NOT NULL);
-    CREATE TABLE questxp_dbc (
-      ID INTEGER PRIMARY KEY,
-      Difficulty_1 INTEGER NOT NULL DEFAULT 0, Difficulty_2 INTEGER NOT NULL DEFAULT 0,
-      Difficulty_3 INTEGER NOT NULL DEFAULT 0, Difficulty_4 INTEGER NOT NULL DEFAULT 0,
-      Difficulty_5 INTEGER NOT NULL DEFAULT 0, Difficulty_6 INTEGER NOT NULL DEFAULT 0,
-      Difficulty_7 INTEGER NOT NULL DEFAULT 0, Difficulty_8 INTEGER NOT NULL DEFAULT 0,
-      Difficulty_9 INTEGER NOT NULL DEFAULT 0, Difficulty_10 INTEGER NOT NULL DEFAULT 0
-    );
-  `);
-  return db;
+function openWorldDb(): WorldTables {
+  return WorldTables.fromRows();
 }
 
-function insertKillQuest(db: Database, id: number, creature: number, count: number, title = "Kill Quest"): void {
-  db.query(
-    `INSERT INTO quest_template (
-       ID, QuestType, QuestLevel, MinLevel, LogTitle, LogDescription, QuestDescription,
-       AreaDescription, QuestCompletionLog, RequiredNpcOrGo1, RequiredNpcOrGoCount1,
-       ObjectiveText1, ObjectiveText2, ObjectiveText3, ObjectiveText4
-     ) VALUES (?, 2, 5, 1, ?, 'Objectives', 'Details', '', 'Done', ?, ?, 'Kill them', '', '', '')`,
-  ).run(id, title, creature, count);
-  db.query("INSERT INTO creature_queststarter (id, quest) VALUES (100, ?)").run(id);
-  db.query("INSERT INTO creature_questender (id, quest) VALUES (100, ?)").run(id);
+const TEXTS = { LogDescription: "Objectives", QuestDescription: "Details", AreaDescription: "", QuestCompletionLog: "Done", ObjectiveText2: "", ObjectiveText3: "", ObjectiveText4: "" };
+
+function insertKillQuest(db: WorldTables, id: number, creature: number, count: number, title = "Kill Quest"): void {
+  db.insert(quest_template, [
+    { ...TEXTS, ID: id, QuestType: 2, QuestLevel: 5, MinLevel: 1, LogTitle: title, RequiredNpcOrGo1: creature, RequiredNpcOrGoCount1: count, ObjectiveText1: "Kill them" },
+  ]);
+  db.insert(creature_queststarter, [{ id: 100, quest: id }]);
+  db.insert(creature_questender, [{ id: 100, quest: id }]);
 }
 
-function insertTalkQuest(db: Database, id: number, creature: number, ender: number): void {
-  db.query(
-    `INSERT INTO quest_template (
-       ID, QuestType, QuestLevel, MinLevel, LogTitle, LogDescription, QuestDescription,
-       AreaDescription, QuestCompletionLog, RequiredNpcOrGo1, RequiredNpcOrGoCount1,
-       ObjectiveText1, ObjectiveText2, ObjectiveText3, ObjectiveText4
-     ) VALUES (?, 2, 5, 1, 'Talk Quest', 'Talk', 'Details', '', 'Done', ?, 1, 'Speak', '', '', '')`,
-  ).run(id, creature);
-  db.query("INSERT INTO creature_queststarter (id, quest) VALUES (200, ?)").run(id);
-  db.query("INSERT INTO creature_questender (id, quest) VALUES (?, ?)").run(ender, id);
+function insertTalkQuest(db: WorldTables, id: number, creature: number, ender: number): void {
+  db.insert(quest_template, [
+    { ...TEXTS, ID: id, QuestType: 2, QuestLevel: 5, MinLevel: 1, LogTitle: "Talk Quest", LogDescription: "Talk", RequiredNpcOrGo1: creature, RequiredNpcOrGoCount1: 1, ObjectiveText1: "Speak" },
+  ]);
+  db.insert(creature_queststarter, [{ id: 200, quest: id }]);
+  db.insert(creature_questender, [{ id: ender, quest: id }]);
 }
 
-function insertDailyQuest(db: Database, id: number): void {
-  db.query(
-    `INSERT INTO quest_template (
-       ID, QuestType, QuestLevel, MinLevel, Flags, LogTitle, LogDescription, QuestDescription,
-       AreaDescription, QuestCompletionLog,
-       ObjectiveText1, ObjectiveText2, ObjectiveText3, ObjectiveText4
-     ) VALUES (?, 0, 5, 1, ?, 'Daily', 'Obj', 'Details', '', 'Done', '', '', '', '')`,
-  ).run(id, QUEST_FLAGS_DAILY);
-  db.query(
-    "INSERT INTO quest_template_addon (ID, SpecialFlags) VALUES (?, 1)",
-  ).run(id);
-  db.query("INSERT INTO creature_queststarter (id, quest) VALUES (300, ?)").run(id);
-  db.query("INSERT INTO creature_questender (id, quest) VALUES (300, ?)").run(id);
+function insertDailyQuest(db: WorldTables, id: number): void {
+  db.insert(quest_template, [
+    { ...TEXTS, ID: id, QuestType: 0, QuestLevel: 5, MinLevel: 1, Flags: QUEST_FLAGS_DAILY, LogTitle: "Daily", LogDescription: "Obj", ObjectiveText1: "" },
+  ]);
+  db.insert(quest_template_addon, [{ ID: id, SpecialFlags: 1 }]);
+  db.insert(creature_queststarter, [{ id: 300, quest: id }]);
+  db.insert(creature_questender, [{ id: 300, quest: id }]);
 }
 
 const speaker = { race: 1, classId: 1, level: 10 };
@@ -141,9 +58,7 @@ describe("quests", () => {
   test("accept kill quest, credit, reward, and block retake", () => {
     const db = openWorldDb();
     insertKillQuest(db, 1, 50, 3, "Wolves");
-    db.query(
-      "INSERT INTO questxp_dbc (ID, Difficulty_1) VALUES (5, 100)",
-    ).run();
+    worldFromSql("INSERT INTO questxp_dbc (ID, Difficulty_1) VALUES (5, 100)", db);
     const catalog = new QuestCatalog(db);
     const log = new QuestLog(catalog);
     log.speaker = speaker;
@@ -163,6 +78,35 @@ describe("quests", () => {
     expect(log.active().has(1)).toBe(false);
     expect(log.rewarded(1)).toBe(true);
     expect(log.canTake(1, speaker)).toBe(false);
+  });
+
+  test("looted items count toward item objectives (ItemAddedQuestCheck) and HasQuestForItem follows them", () => {
+    const db = openWorldDb();
+    db.insert(quest_template, [
+      { ...TEXTS, ID: 30, QuestType: 2, QuestLevel: 5, MinLevel: 1, LogTitle: "Pelts", RequiredItemId1: 750, RequiredItemCount1: 3, ObjectiveText1: "" },
+    ]);
+    db.insert(creature_queststarter, [{ id: 100, quest: 30 }]);
+    const log = new QuestLog(new QuestCatalog(db));
+    log.speaker = speaker;
+    let owned = 0;
+    const opts = { ownedCount: () => owned, itemProto: () => ({ maxcount: 0, maxStackSize: 20 }) };
+    expect(log.hasQuestForItem(750, opts)).toBe(false);
+    expect(log.accept(30)).toBe("ok");
+    expect(log.hasQuestForItem(750, opts)).toBe(true);
+
+    expect(log.itemAddedQuestCheck(750, 2)).toBe(false);
+    owned = 2;
+    expect(log.active().get(30)!.item[0]).toBe(2);
+    // the bags already hold enough: the loot view hides it (showInLoot) while the quest still wants it
+    owned = 3;
+    const showInLoot = { value: true };
+    expect(log.hasQuestForItem(750, { ...opts, showInLoot })).toBe(false);
+    expect(showInLoot.value).toBe(false);
+
+    expect(log.itemAddedQuestCheck(750, 5)).toBe(true);
+    expect(log.active().get(30)!.item[0]).toBe(3);
+    expect(log.status(30)).toBe(QUEST_STATUS_COMPLETE);
+    expect(log.hasQuestForItem(750, opts)).toBe(false);
   });
 
   test("talk credit only advances speak-to ender objectives", () => {
@@ -206,7 +150,7 @@ describe("quests", () => {
     expect(reader.readU64()).toBe(99n);
   });
 
-  test("save and load roundtrip of mob counts", () => {
+  test("save and load roundtrip of mob counts", async () => {
     const world = openWorldDb();
     insertKillQuest(world, 40, 9, 4);
     const catalog = new QuestCatalog(world);
@@ -217,11 +161,11 @@ describe("quests", () => {
     log.creditKill(9, 2n);
     expect(log.objective(40, 0)).toBe(2);
 
-    const chars = new Database(":memory:", { strict: true });
-    log.save(chars, 7);
+    const chars = await testDatabase("characters");
+    await log.save(chars, 7);
 
     const loaded = new QuestLog(catalog);
-    loaded.load(chars, 7);
+    await loaded.load(chars, 7);
     expect(loaded.status(40)).toBe(QUEST_STATUS_INCOMPLETE);
     expect(loaded.objective(40, 0)).toBe(2);
   });

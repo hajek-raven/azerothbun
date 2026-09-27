@@ -1,4 +1,21 @@
-import type { Database } from "bun:sqlite";
+import type { Db } from "../database/database.ts";
+import {
+  creature_questender,
+  creature_queststarter,
+  gameobject_questender,
+  gameobject_queststarter,
+  quest_details,
+  quest_money_reward,
+  quest_offer_reward,
+  quest_poi,
+  quest_poi_points,
+  quest_request_items,
+  quest_template,
+  quest_template_addon,
+  questfactionreward_dbc,
+  questxp_dbc,
+} from "../database/schema/world.ts";
+import type { WorldTables } from "../database/world-tables.ts";
 import {
   loadQuestStatus,
   saveQuestStatus,
@@ -216,13 +233,6 @@ const QUEST_SORT_BREWFEST = 370;
 const QUEST_SORT_NOBLEGARDEN = 374;
 const QUEST_SORT_LOVE_IS_IN_THE_AIR = 376;
 
-function tableExists(db: Database, name: string): boolean {
-  const row = db.query("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as
-    | { ok: number }
-    | null;
-  return row !== null;
-}
-
 function asNumber(value: unknown, fallback = 0): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -308,12 +318,12 @@ function questLevelForPlayer(q: QuestTemplate, playerLevel: number): number {
 
 function hasObjectives(q: QuestTemplate): boolean {
   for (let i = 0; i < 4; i += 1) {
-    if (q.requiredNpcOrGo[i] !== 0 && q.requiredNpcOrGoCount[i] > 0) {
+    if (q.requiredNpcOrGo[i] !== 0 && (q.requiredNpcOrGoCount[i] ?? 0) > 0) {
       return true;
     }
   }
   for (let i = 0; i < 6; i += 1) {
-    if (q.requiredItemId[i] !== 0 && q.requiredItemCount[i] > 0) {
+    if (q.requiredItemId[i] !== 0 && (q.requiredItemCount[i] ?? 0) > 0) {
       return true;
     }
   }
@@ -442,7 +452,7 @@ export class QuestCatalog {
   readonly factionRewards = new Map<number, number[]>();
   readonly moneyByLevel = new Map<number, number[]>();
 
-  constructor(db: Database) {
+  constructor(db: WorldTables) {
     this.load(db);
   }
 
@@ -464,9 +474,9 @@ export class QuestCatalog {
     return this.pois.get(questId) ?? [];
   }
 
-  private load(db: Database): void {
-    if (tableExists(db, "quest_template")) {
-      const rows = db.query("SELECT * FROM quest_template").all() as Record<string, unknown>[];
+  private load(db: WorldTables): void {
+    if (db.has(quest_template)) {
+      const rows = db.all(quest_template) as readonly Record<string, unknown>[];
       for (const row of rows) {
         const id = asNumber(row.ID ?? row.id);
         const quest: QuestTemplate = {
@@ -619,8 +629,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "quest_template_addon")) {
-      const rows = db.query("SELECT * FROM quest_template_addon").all() as Record<string, unknown>[];
+    if (db.has(quest_template_addon)) {
+      const rows = db.all(quest_template_addon) as readonly Record<string, unknown>[];
       for (const row of rows) {
         const quest = this.quests.get(asNumber(row.ID ?? row.id));
         if (!quest) {
@@ -636,8 +646,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "quest_offer_reward")) {
-      const rows = db.query("SELECT * FROM quest_offer_reward").all() as Record<string, unknown>[];
+    if (db.has(quest_offer_reward)) {
+      const rows = db.all(quest_offer_reward) as readonly Record<string, unknown>[];
       for (const row of rows) {
         const quest = this.quests.get(asNumber(row.ID ?? row.id));
         if (!quest) {
@@ -659,8 +669,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "quest_request_items")) {
-      const rows = db.query("SELECT * FROM quest_request_items").all() as Record<string, unknown>[];
+    if (db.has(quest_request_items)) {
+      const rows = db.all(quest_request_items) as readonly Record<string, unknown>[];
       for (const row of rows) {
         const quest = this.quests.get(asNumber(row.ID ?? row.id));
         if (!quest) {
@@ -672,8 +682,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "quest_details")) {
-      const rows = db.query("SELECT * FROM quest_details").all() as Record<string, unknown>[];
+    if (db.has(quest_details)) {
+      const rows = db.all(quest_details) as readonly Record<string, unknown>[];
       for (const row of rows) {
         const quest = this.quests.get(asNumber(row.ID ?? row.id));
         if (!quest) {
@@ -694,17 +704,20 @@ export class QuestCatalog {
       }
     }
 
-    this.loadRelations(db, "creature_queststarter", this.creatureStarters);
-    this.loadRelations(db, "creature_questender", this.creatureEnders);
-    this.loadRelations(db, "gameobject_queststarter", this.goStarters);
-    this.loadRelations(db, "gameobject_questender", this.goEnders);
+    this.loadRelations(db, creature_queststarter, this.creatureStarters);
+    this.loadRelations(db, creature_questender, this.creatureEnders);
+    this.loadRelations(db, gameobject_queststarter, this.goStarters);
+    this.loadRelations(db, gameobject_questender, this.goEnders);
 
-    if (tableExists(db, "quest_poi")) {
-      const poiRows = db.query("SELECT * FROM quest_poi").all() as Record<string, unknown>[];
-      const pointRows = tableExists(db, "quest_poi_points")
-        ? (db
-            .query("SELECT * FROM quest_poi_points ORDER BY QuestID, Idx1, Idx2")
-            .all() as Record<string, unknown>[])
+    if (db.has(quest_poi)) {
+      const poiRows = db.all(quest_poi) as readonly Record<string, unknown>[];
+      const pointRows = db.has(quest_poi_points)
+        ? [...(db.all(quest_poi_points) as readonly Record<string, unknown>[])].sort(
+            (left, right) =>
+              asNumber(left.QuestID) - asNumber(right.QuestID) ||
+              asNumber(left.Idx1) - asNumber(right.Idx1) ||
+              asNumber(left.Idx2) - asNumber(right.Idx2),
+          )
         : [];
       const pointsByKey = new Map<string, QuestPoiPoint[]>();
       for (const row of pointRows) {
@@ -734,8 +747,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "questxp_dbc")) {
-      for (const row of db.query("SELECT * FROM questxp_dbc").all() as Record<string, unknown>[]) {
+    if (db.has(questxp_dbc)) {
+      for (const row of db.all(questxp_dbc) as readonly Record<string, unknown>[]) {
         this.xpByLevel.set(asNumber(row.ID), [
           asNumber(row.Difficulty_1),
           asNumber(row.Difficulty_2),
@@ -751,8 +764,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "questfactionreward_dbc")) {
-      for (const row of db.query("SELECT * FROM questfactionreward_dbc").all() as Record<string, unknown>[]) {
+    if (db.has(questfactionreward_dbc)) {
+      for (const row of db.all(questfactionreward_dbc) as readonly Record<string, unknown>[]) {
         this.factionRewards.set(asNumber(row.ID), [
           asNumber(row.Difficulty_1),
           asNumber(row.Difficulty_2),
@@ -768,8 +781,8 @@ export class QuestCatalog {
       }
     }
 
-    if (tableExists(db, "quest_money_reward")) {
-      for (const row of db.query("SELECT * FROM quest_money_reward").all() as Record<string, unknown>[]) {
+    if (db.has(quest_money_reward)) {
+      for (const row of db.all(quest_money_reward) as readonly Record<string, unknown>[]) {
         this.moneyByLevel.set(asNumber(row.Level), [
           asNumber(row.Money0),
           asNumber(row.Money1),
@@ -794,12 +807,12 @@ export class QuestCatalog {
     }
   }
 
-  private loadRelations(db: Database, table: string, target: Map<number, number[]>): void {
-    if (!tableExists(db, table)) {
-      return;
-    }
-    const rows = db.query(`SELECT id, quest FROM ${table}`).all() as { id: number; quest: number }[];
-    for (const row of rows) {
+  private loadRelations(
+    db: WorldTables,
+    table: typeof creature_queststarter | typeof creature_questender | typeof gameobject_queststarter | typeof gameobject_questender,
+    target: Map<number, number[]>,
+  ): void {
+    for (const row of db.all(table)) {
       const list = target.get(row.id) ?? [];
       list.push(row.quest);
       target.set(row.id, list);
@@ -823,8 +836,8 @@ export class QuestLog {
     return this.catalog;
   }
 
-  load(db: Database, guid: number): void {
-    const state = loadQuestStatus(db, guid);
+  async load(db: Db, guid: number): Promise<void> {
+    const state = await loadQuestStatus(db, guid);
     this.activeQuests.clear();
     this.rewardedQuests.clear();
     this.dailyQuests.clear();
@@ -867,7 +880,7 @@ export class QuestLog {
     this.rebuildSlots();
   }
 
-  save(db: Database, guid: number): void {
+  async save(db: Db, guid: number): Promise<void> {
     const state: QuestStatusState = {
       active: [],
       rewarded: [],
@@ -910,7 +923,7 @@ export class QuestLog {
     for (const [quest, event] of this.seasonalQuests) {
       state.seasonal.push({ quest, event });
     }
-    saveQuestStatus(db, guid, state);
+    await saveQuestStatus(db, guid, state);
   }
 
   status(questId: number): number {
@@ -1292,26 +1305,122 @@ export class QuestLog {
     return true;
   }
 
-  addItem(itemId: number, count: number): void {
-    for (const [questId, aq] of this.activeQuests) {
-      if (aq.status !== QUEST_STATUS_INCOMPLETE) {
+  /**
+   * `Player::HasQuestForItem`: an item a quest in the log still collects (`RequiredItemId`) or hands out (`ItemDrop`).
+   * `showInLoot` is cleared when a quest needs the item but the bags already hold enough of it.
+   */
+  hasQuestForItem(
+    itemId: number,
+    opts: {
+      /** `Player::GetItemCount(itemid, true)` */
+      ownedCount: (itemId: number) => number;
+      /** `item_template.maxcount` and `ItemTemplate::GetMaxStackSize` */
+      itemProto: (itemId: number) => { maxcount: number; maxStackSize: number } | null;
+      excludeQuestId?: number;
+      turnIn?: boolean;
+      showInLoot?: { value: boolean };
+    },
+  ): boolean {
+    const turnIn = opts.turnIn ?? false;
+    for (const questId of this.slots) {
+      if (questId === 0 || questId === opts.excludeQuestId) {
+        continue;
+      }
+      const aq = this.activeQuests.get(questId);
+      if (!aq) {
+        continue;
+      }
+      if (aq.status !== QUEST_STATUS_INCOMPLETE && !(turnIn && aq.status === QUEST_STATUS_COMPLETE)) {
         continue;
       }
       const quest = this.catalog.quest(questId);
       if (!quest) {
         continue;
       }
-      for (let i = 0; i < 6; i += 1) {
-        if (quest.requiredItemId[i] !== itemId) {
+      // There should be no mixed ReqItem/ReqSource drop
+      // This part for ReqItem drop
+      for (let j = 0; j < 6; j++) {
+        const required = quest.requiredItemCount[j] ?? 0;
+        const collected = aq.item[j] ?? 0;
+        if (itemId === quest.requiredItemId[j] && collected < required) {
+          if (opts.showInLoot) {
+            if (opts.ownedCount(itemId) < required) {
+              return true;
+            }
+            opts.showInLoot.value = false;
+          } else {
+            return true;
+          }
+        }
+        if (turnIn && collected >= required) {
+          return true;
+        }
+      }
+      // This part - for ReqSource
+      for (let j = 0; j < 4; j++) {
+        // examined item is a source item
+        if (quest.itemDrop[j] !== itemId) {
           continue;
         }
-        const required = quest.requiredItemCount[i] ?? 0;
-        aq.item[i] = Math.min(required, (aq.item[i] ?? 0) + count);
-      }
-      if (this.objectivesMet(quest, aq)) {
-        aq.status = QUEST_STATUS_COMPLETE;
+        const proto = opts.itemProto(itemId);
+        if (!proto) {
+          continue;
+        }
+        const ownedCount = opts.ownedCount(itemId);
+        // 'unique' item
+        if ((proto.maxcount && ownedCount < proto.maxcount) || (turnIn && ownedCount >= proto.maxcount)) {
+          return true;
+        }
+        // allows custom amount drop when not 0
+        const quantity = quest.itemDropQuantity[j] ?? 0;
+        if (quantity) {
+          if (ownedCount < quantity || (turnIn && ownedCount >= quantity)) {
+            return true;
+          }
+        } else if (ownedCount < proto.maxStackSize) {
+          return true;
+        }
       }
     }
+    return false;
+  }
+
+  /**
+   * `Player::ItemAddedQuestCheck`: counts `count` of `entry` toward the item objectives in the log and completes the quests that are done.
+   * Returns true when a quest was completed (its log slot state changed).
+   */
+  itemAddedQuestCheck(entry: number, count: number): boolean {
+    let completed = false;
+    for (const questId of this.slots) {
+      if (questId === 0) {
+        continue;
+      }
+      const aq = this.activeQuests.get(questId);
+      if (!aq || aq.status !== QUEST_STATUS_INCOMPLETE) {
+        continue;
+      }
+      const quest = this.catalog.quest(questId);
+      // `QUEST_SPECIAL_FLAGS_DELIVER` is set at load for a quest with a `RequiredItemId`.
+      if (!quest || !quest.requiredItemId.some((id) => id !== 0)) {
+        continue;
+      }
+      for (let j = 0; j < 6; j++) {
+        if (quest.requiredItemId[j] !== entry) {
+          continue;
+        }
+        const required = quest.requiredItemCount[j] ?? 0;
+        const current = aq.item[j] ?? 0;
+        if (current < required) {
+          aq.item[j] = Math.min(current + count, required);
+        }
+        // `CanCompleteQuest` → `CompleteQuest`
+        if (aq.status === QUEST_STATUS_INCOMPLETE && this.objectivesMet(quest, aq)) {
+          aq.status = QUEST_STATUS_COMPLETE;
+          completed = true;
+        }
+      }
+    }
+    return completed;
   }
 
   private menuEntry(quest: QuestTemplate, icon: number): QuestMenuEntry {

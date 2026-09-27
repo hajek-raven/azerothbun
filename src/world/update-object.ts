@@ -72,6 +72,8 @@ export type PlayerFieldStats = {
   maxPower: number;
   attributes?: PlayerStatValues;
   skills?: readonly PlayerSkillValue[];
+  /** Raw fields from `PlayerStats` (and the skill slots); they override the values above. */
+  fields?: readonly { index: number; value: number }[];
 };
 
 export function playerCreateBlock(character: Character, stats?: PlayerFieldStats): Uint8Array {
@@ -136,6 +138,12 @@ export function playerUpdateBlock(
   values[PLAYER_BYTES_2] = character.facialStyle;
   values[PLAYER_BYTES_3] = character.gender;
   values[PLAYER_FIELD_WATCHED_FACTION_INDEX] = 0xffffffff;
+  const force = new Set([UNIT_FIELD_BYTES_1]);
+  for (const field of stats?.fields ?? []) {
+    if (field.index >= 0 && field.index < values.length) {
+      values[field.index] = field.value >>> 0;
+    }
+  }
 
   const flags = (self ? UPDATEFLAG_SELF : 0) | UPDATEFLAG_LIVING | UPDATEFLAG_STATIONARY_POSITION;
   const body = new ByteWriter()
@@ -154,7 +162,6 @@ export function playerUpdateBlock(
   for (const speed of SPEEDS) {
     body.writeF32(speed);
   }
-  const force = new Set([UNIT_FIELD_BYTES_1]);
   if (stats && stats.powerType >= 0 && stats.powerType <= 6) {
     force.add(UNIT_FIELD_POWER1 + stats.powerType);
     force.add(UNIT_FIELD_MAXPOWER1 + stats.powerType);
@@ -239,9 +246,6 @@ function raceAppearance(race: number, gender: number): { faction: number; displa
 function powerType(classId: number): number {
   if (classId === 1) {
     return 1;
-  }
-  if (classId === 3) {
-    return 2;
   }
   if (classId === 4) {
     return 3;

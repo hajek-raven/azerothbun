@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import type { Socket } from "bun";
 import { WorldCrypt } from "../crypto/world-crypt.ts";
-import { listCharacters, openAuthDatabase, saveSessionKey } from "../db.ts";
+import { eq } from "drizzle-orm";
+import { seededTestDatabases } from "../database/test-db.ts";
+import { characters } from "../database/schema/characters.ts";
+import { listCharacters, saveSessionKey } from "../db.ts";
 import { ByteReader, ByteWriter } from "../net/byte-buffer.ts";
 import {
   authSeed,
@@ -23,10 +26,11 @@ import { startWorldServer } from "./server.ts";
 const HEARTBEAT = 0x0ee;
 
 test("nearby players are created, moved, and destroyed", async () => {
-  const db = openAuthDatabase(":memory:");
+  const db = await seededTestDatabases();
   const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db });
   const port = server.port ?? 0;
   const first = await enter(port, db, "TEST", 1, false);
+  await db.characters.update(characters).set({ playerFlags: 32 }).where(eq(characters.name, "Testtwo"));
   const second = await enter(port, db, "TEST2", 2, true);
   expect(second.other?.[4]).toBe(3);
   expect(containsU32(second.other!, 49)).toBe(true);
@@ -75,14 +79,14 @@ test("nearby players are created, moved, and destroyed", async () => {
 
 async function enter(
   port: number,
-  db: ReturnType<typeof openAuthDatabase>,
+  db: Awaited<ReturnType<typeof seededTestDatabases>>,
   username: string,
   accountId: number,
   otherAlreadyIn: boolean,
 ): Promise<{ client: TestClient; crypt: WorldCrypt; other: Uint8Array | null }> {
   const sessionKey = new Uint8Array(40);
   crypto.getRandomValues(sessionKey);
-  saveSessionKey(db, username, sessionKey);
+  await saveSessionKey(db.login, username, sessionKey);
   const client = await connect(port);
   const challenge = await readServerPacket(client, null);
   expect(challenge.opcode).toBe(SMSG_AUTH_CHALLENGE);
@@ -112,17 +116,18 @@ async function enter(
   expect(response.opcode).toBe(SMSG_AUTH_RESPONSE);
   await readServerPacket(client, crypt);
   await readServerPacket(client, crypt);
+  await readServerPacket(client, crypt);
   client.send(encodeClientPacket(CMSG_CHAR_ENUM, new Uint8Array(0), crypt));
   const enumerated = await readServerPacket(client, crypt);
   expect(enumerated.opcode).toBe(SMSG_CHAR_ENUM);
-  const character = listCharacters(db, accountId)[0];
+  const character = (await listCharacters(db.characters, accountId))[0];
   expect(character).toBeDefined();
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(BigInt(character!.guid)).toUint8Array(), crypt));
   let other: Uint8Array | null = null;
-  const count = otherAlreadyIn ? 18 : 17;
+  const count = otherAlreadyIn ? 17 : 16;
   for (let index = 0; index < count; index++) {
     const packet = await readServerPacket(client, crypt);
-    if (index === 17) {
+    if (index === 16) {
       expect(packet.opcode).toBe(SMSG_UPDATE_OBJECT);
       other = packet.payload;
     }
@@ -168,10 +173,17 @@ async function readUntil(client: TestClient, crypt: WorldCrypt, opcode: number):
 type ServerPacket = { opcode: number; payload: Uint8Array; raw: Uint8Array };
 
 async function readServerPacket(client: TestClient, crypt: WorldCrypt | null): Promise<ServerPacket> {
-  const header = await client.read(4);
+  let header = await client.read(4);
   crypt?.decryptHeader(header);
-  const size = (header[0]! << 8) | header[1]!;
-  const opcode = header[2]! | (header[3]! << 8);
+  if ((header[0]! & 0x80) !== 0) {
+    // `ServerPktHeader` for packets over 0x7FFF bytes: a 3-byte size, decrypted as one stream with the rest.
+    const last = await client.read(1);
+    crypt?.decryptHeader(last);
+    header = Uint8Array.of(...header, last[0]!);
+  }
+  const large = header.length === 5;
+  const size = large ? ((header[0]! & 0x7f) << 16) | (header[1]! << 8) | header[2]! : (header[0]! << 8) | header[1]!;
+  const opcode = large ? header[3]! | (header[4]! << 8) : header[2]! | (header[3]! << 8);
   const payload = await client.read(size - 2);
   const raw = new Uint8Array(header.length + payload.length);
   raw.set(header, 0);

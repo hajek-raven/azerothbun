@@ -1,4 +1,13 @@
-import type { Database } from "bun:sqlite";
+import type { MySqlTable } from "drizzle-orm/mysql-core";
+import {
+  broadcast_text,
+  conditions,
+  gossip_menu,
+  gossip_menu_option,
+  npc_text,
+  points_of_interest,
+} from "../database/schema/world.ts";
+import type { WorldTables } from "../database/world-tables.ts";
 import { ByteWriter } from "../net/byte-buffer.ts";
 
 export const SMSG_GOSSIP_MESSAGE = 0x17d;
@@ -141,11 +150,16 @@ type PoiRow = {
   name: string;
 };
 
-function tableExists(db: Database, name: string): boolean {
-  return (
-    db.query<{ name: string }, [string]>("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name) !==
-    null
-  );
+type LooseRow = Record<string, unknown>;
+
+function sortedRows(db: WorldTables, table: MySqlTable, ...columns: string[]): LooseRow[] {
+  return [...(db.all(table) as readonly LooseRow[])].sort((left, right) => {
+    for (const column of columns) {
+      const diff = asNumber(left[column]) - asNumber(right[column]);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  });
 }
 
 function asString(value: unknown): string {
@@ -329,7 +343,7 @@ export class GossipCatalog {
   private readonly conditionsByKey = new Map<string, ConditionRow[]>();
   private readonly helloByEntry = new Map<number, ConditionRow[]>();
 
-  constructor(db: Database) {
+  constructor(db: WorldTables) {
     this.loadBroadcastText(db);
     this.loadGossipMenu(db);
     this.loadGossipMenuOption(db);
@@ -426,20 +440,8 @@ export class GossipCatalog {
     return this.conditionsByKey.get(`${sourceType}:${sourceGroup}:${sourceEntry}`) ?? [];
   }
 
-  private loadBroadcastText(db: Database): void {
-    if (!tableExists(db, "broadcast_text")) {
-      return;
-    }
-    for (const row of db
-      .query(
-        `SELECT ID, IFNULL(LanguageID, 0) AS LanguageID, IFNULL(MaleText, '') AS MaleText,
-                IFNULL(FemaleText, '') AS FemaleText, IFNULL(EmoteID1, 0) AS EmoteID1,
-                IFNULL(EmoteDelay1, 0) AS EmoteDelay1, IFNULL(EmoteID2, 0) AS EmoteID2,
-                IFNULL(EmoteDelay2, 0) AS EmoteDelay2, IFNULL(EmoteID3, 0) AS EmoteID3,
-                IFNULL(EmoteDelay3, 0) AS EmoteDelay3
-         FROM broadcast_text`,
-      )
-      .all() as Array<Record<string, unknown>>) {
+  private loadBroadcastText(db: WorldTables): void {
+    for (const row of db.all(broadcast_text) as readonly LooseRow[]) {
       this.broadcastTexts.set(asNumber(row.ID), {
         languageId: asNumber(row.LanguageID),
         maleText: asString(row.MaleText),
@@ -454,13 +456,8 @@ export class GossipCatalog {
     }
   }
 
-  private loadGossipMenu(db: Database): void {
-    if (!tableExists(db, "gossip_menu")) {
-      return;
-    }
-    for (const row of db
-      .query(`SELECT MenuID, TextID FROM gossip_menu ORDER BY MenuID, TextID`)
-      .all() as Array<Record<string, unknown>>) {
+  private loadGossipMenu(db: WorldTables): void {
+    for (const row of sortedRows(db, gossip_menu, "MenuID", "TextID")) {
       const menuId = asNumber(row.MenuID);
       const textId = asNumber(row.TextID);
       const list = this.menuTexts.get(menuId);
@@ -473,18 +470,8 @@ export class GossipCatalog {
     }
   }
 
-  private loadGossipMenuOption(db: Database): void {
-    if (!tableExists(db, "gossip_menu_option")) {
-      return;
-    }
-    for (const row of db
-      .query(
-        `SELECT MenuID, OptionID, OptionIcon, IFNULL(OptionText, '') AS OptionText,
-                OptionBroadcastTextID, OptionType, OptionNpcFlag, ActionMenuID, ActionPoiID,
-                BoxCoded, BoxMoney, IFNULL(BoxText, '') AS BoxText, BoxBroadcastTextID
-         FROM gossip_menu_option ORDER BY MenuID, OptionID`,
-      )
-      .all() as Array<Record<string, unknown>>) {
+  private loadGossipMenuOption(db: WorldTables): void {
+    for (const row of sortedRows(db, gossip_menu_option, "MenuID", "OptionID")) {
       const menuId = asNumber(row.MenuID);
       const option: MenuOptionRow = {
         optionId: asNumber(row.OptionID),
@@ -510,29 +497,8 @@ export class GossipCatalog {
     }
   }
 
-  private loadNpcText(db: Database): void {
-    if (!tableExists(db, "npc_text")) {
-      return;
-    }
-    const slotSelects: string[] = [];
-    for (let n = 0; n < 8; n++) {
-      slotSelects.push(
-        `IFNULL(text${n}_0, '') AS text${n}_0`,
-        `IFNULL(text${n}_1, '') AS text${n}_1`,
-        `BroadcastTextID${n}`,
-        `lang${n}`,
-        `Probability${n}`,
-        `em${n}_0`,
-        `em${n}_1`,
-        `em${n}_2`,
-        `em${n}_3`,
-        `em${n}_4`,
-        `em${n}_5`,
-      );
-    }
-    for (const row of db
-      .query(`SELECT ID, ${slotSelects.join(", ")} FROM npc_text`)
-      .all() as Array<Record<string, unknown>>) {
+  private loadNpcText(db: WorldTables): void {
+    for (const row of db.all(npc_text) as readonly LooseRow[]) {
       const slots: NpcTextSlot[] = [];
       const broadcastTextIds: number[] = [];
       for (let n = 0; n < 8; n++) {
@@ -553,16 +519,8 @@ export class GossipCatalog {
     }
   }
 
-  private loadPointsOfInterest(db: Database): void {
-    if (!tableExists(db, "points_of_interest")) {
-      return;
-    }
-    for (const row of db
-      .query(
-        `SELECT ID, PositionX, PositionY, Icon, Flags, Importance, IFNULL(Name, '') AS Name
-         FROM points_of_interest`,
-      )
-      .all() as Array<Record<string, unknown>>) {
+  private loadPointsOfInterest(db: WorldTables): void {
+    for (const row of db.all(points_of_interest) as readonly LooseRow[]) {
       this.pointsOfInterest.set(asNumber(row.ID), {
         flags: asNumber(row.Flags),
         x: asNumber(row.PositionX),
@@ -574,19 +532,9 @@ export class GossipCatalog {
     }
   }
 
-  private loadConditions(db: Database): void {
-    if (!tableExists(db, "conditions")) {
-      return;
-    }
-    for (const row of db
-      .query(
-        `SELECT SourceTypeOrReferenceId, SourceGroup, SourceEntry, ElseGroup,
-                ConditionTypeOrReference, ConditionValue1, ConditionValue2, ConditionValue3,
-                NegativeCondition
-         FROM conditions
-         WHERE SourceTypeOrReferenceId IN (14, 15, 20)`,
-      )
-      .all() as Array<Record<string, unknown>>) {
+  private loadConditions(db: WorldTables): void {
+    const sources = new Set([SOURCE_GOSSIP_MENU, SOURCE_GOSSIP_MENU_OPTION, SOURCE_GOSSIP_HELLO]);
+    for (const row of (db.all(conditions) as readonly LooseRow[]).filter((row) => sources.has(asNumber(row.SourceTypeOrReferenceId)))) {
       const sourceType = asNumber(row.SourceTypeOrReferenceId);
       const sourceGroup = asNumber(row.SourceGroup);
       const sourceEntry = asNumber(row.SourceEntry);

@@ -4,12 +4,20 @@
   "type": "module",
   "private": true,
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "drizzle-kit": "1.0.0-rc.4"
   },
   "peerDependencies": {
     "typescript": "^7"
   },
   "scripts": {
-    "dev": "bun --hot src/index.ts"
+    "dev": "bun --hot src/index.ts",
+    "dev:no-hot": "bun src/index.ts",
+    "db:up": "docker compose up -d --wait",
+    "db:update": "bun src/tools/db-update.ts",
+    "gen:db-schema": "bun src/tools/gen-db-schema.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "1.0.0-rc.4"
   }
 }

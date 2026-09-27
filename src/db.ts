@@ -1,12 +1,43 @@
-import { constants, Database } from "bun:sqlite";
-import { ensureCharacterTables } from "./characters/store.ts";
+import { and, asc, eq, sql, type InferSelectModel } from "drizzle-orm";
+import { refreshRealmCharacterCount } from "./characters/live.ts";
 import { makeRegistrationData } from "./crypto/srp6.ts";
+import type { Db } from "./database/database.ts";
+import { account, realmlist } from "./database/schema/auth.ts";
+import { character_inventory, characters } from "./database/schema/characters.ts";
+import type { WorldTables } from "./database/world-tables.ts";
+import { objectGuids } from "./game/globals/object-guids.ts";
+import { createItem } from "./items/instance.ts";
 
 export const CLIENT_BUILD = 12340;
-export const REALM_ADDRESS = "127.0.0.1";
-export const REALM_PORT = 8085;
 
-const SEED_ACCOUNTS = [
+/** Backpack slots 23–38. Entries are `item_template` rows used to try bags, equip, use, and sell. */
+const BAG_TEST_ITEMS = [
+  { slot: 23, entry: 2589, count: 5 },
+  { slot: 24, entry: 159, count: 5, charges: [-1, 0, 0, 0, 0] },
+  { slot: 25, entry: 118, count: 1, charges: [-1, 0, 0, 0, 0] },
+  { slot: 26, entry: 6948, count: 1 },
+  { slot: 27, entry: 25, count: 1, durability: 20, maxDurability: 20 },
+  { slot: 28, entry: 4496, count: 1 },
+] as const;
+
+type SeedAccount = {
+  username: string;
+  password: string;
+  character: {
+    name: string;
+    gender: number;
+    skin: number;
+    face: number;
+    hairStyle: number;
+    hairColor: number;
+    facialStyle: number;
+    position_y: number;
+    money?: number;
+    bag?: readonly (typeof BAG_TEST_ITEMS)[number][];
+  };
+};
+
+const SEED_ACCOUNTS: SeedAccount[] = [
   {
     username: "TEST",
     password: "TEST",
@@ -17,583 +48,168 @@ const SEED_ACCOUNTS = [
     password: "TEST2",
     character: { name: "Testtwo", gender: 1, skin: 2, face: 2, hairStyle: 3, hairColor: 4, facialStyle: 1, position_y: -136 },
   },
-] as const;
+  {
+    username: "TEST3",
+    password: "TEST3",
+    character: {
+      name: "Bagtest",
+      gender: 0,
+      skin: 4,
+      face: 3,
+      hairStyle: 5,
+      hairColor: 2,
+      facialStyle: 2,
+      position_y: -140,
+      money: 50_000,
+      bag: BAG_TEST_ITEMS,
+    },
+  },
+];
 
-export type Account = {
-  id: number;
-  username: string;
-  salt: Uint8Array;
-  verifier: Uint8Array;
-  session_key: Uint8Array | null;
-  totp_secret: Uint8Array | null;
-  email: string;
-  reg_mail: string;
-  joindate: string;
-  last_ip: string;
-  last_attempt_ip: string;
-  failed_logins: number;
-  locked: number;
-  lock_country: string;
-  last_login: string | null;
-  online: number;
-  expansion: number;
-  Flags: number;
-  mutetime: number;
-  mutereason: string;
-  muteby: string;
-  locale: number;
-  os: string;
-  recruiter: number;
-  totaltime: number;
-};
+/** `acore_auth.account`. */
+export type Account = InferSelectModel<typeof account>;
 
-export type Character = {
-  guid: number;
-  account: number;
-  name: string;
-  race: number;
-  class: number;
-  gender: number;
-  level: number;
-  xp: number;
-  money: number;
-  skin: number;
-  face: number;
-  hairStyle: number;
-  hairColor: number;
-  facialStyle: number;
-  bankSlots: number;
-  restState: number;
-  playerFlags: number;
-  position_x: number;
-  position_y: number;
-  position_z: number;
-  map: number;
-  instance_id: number;
-  instance_mode_mask: number;
-  orientation: number;
-  taximask: string;
-  online: number;
-  cinematic: number;
-  totaltime: number;
-  leveltime: number;
-  logout_time: number;
-  is_logout_resting: number;
-  rest_bonus: number;
-  resettalents_cost: number;
-  resettalents_time: number;
-  trans_x: number;
-  trans_y: number;
-  trans_z: number;
-  trans_o: number;
-  transguid: number;
-  extra_flags: number;
-  stable_slots: number;
-  at_login: number;
-  zone: number;
-  death_expire_time: number;
-  taxi_path: string | null;
-  arenaPoints: number;
-  totalHonorPoints: number;
-  todayHonorPoints: number;
-  yesterdayHonorPoints: number;
-  totalKills: number;
-  todayKills: number;
-  yesterdayKills: number;
-  chosenTitle: number;
-  knownCurrencies: number;
-  watchedFaction: number;
-  drunk: number;
-  health: number;
-  power1: number;
-  power2: number;
-  power3: number;
-  power4: number;
-  power5: number;
-  power6: number;
-  power7: number;
-  latency: number;
-  talentGroupsCount: number;
-  activeTalentGroup: number;
-  exploredZones: string | null;
-  equipmentCache: string | null;
-  ammoId: number;
-  knownTitles: string | null;
-  actionBars: number;
-  grantableLevels: number;
-  order: number | null;
-  creation_date: string;
-  deleteInfos_Account: number | null;
-  deleteInfos_Name: string | null;
-  deleteDate: number | null;
-  innTriggerId: number;
-  extraBonusTalentCount: number;
-};
+/** `acore_characters.characters`. */
+export type Character = InferSelectModel<typeof characters>;
 
-export type Realm = {
-  id: number;
-  name: string;
-  address: string;
-  localAddress: string;
-  localSubnetMask: string;
-  port: number;
-  icon: number;
-  flag: number;
-  timezone: number;
-  allowedSecurityLevel: number;
-  population: number;
-  gamebuild: number;
-};
+/** `acore_auth.realmlist`. */
+export type Realm = InferSelectModel<typeof realmlist>;
 
-const ACCOUNT_COLUMNS = `id, username, salt, verifier, session_key, totp_secret, email, reg_mail, joindate, last_ip,
-  last_attempt_ip, failed_logins, locked, lock_country, last_login, online, expansion, Flags, mutetime, mutereason,
-  muteby, locale, os, recruiter, totaltime`;
+export async function findAccount(db: Db, username: string): Promise<Account | null> {
+  const [row] = await db.select().from(account).where(eq(account.username, username));
+  return row ?? null;
+}
 
-const CHARACTER_COLUMNS = `guid, account, name, race, class, gender, level, xp, money, skin, face, hairStyle, hairColor,
-  facialStyle, bankSlots, restState, playerFlags, position_x, position_y, position_z, map, instance_id, instance_mode_mask,
-  orientation, taximask, online, cinematic, totaltime, leveltime, logout_time, is_logout_resting, rest_bonus,
-  resettalents_cost, resettalents_time, trans_x, trans_y, trans_z, trans_o, transguid, extra_flags, stable_slots, at_login,
-  zone, death_expire_time, taxi_path, arenaPoints, totalHonorPoints, todayHonorPoints, yesterdayHonorPoints, totalKills,
-  todayKills, yesterdayKills, chosenTitle, knownCurrencies, watchedFaction, drunk, health, power1, power2, power3, power4,
-  power5, power6, power7, latency, talentGroupsCount, activeTalentGroup, exploredZones, equipmentCache, ammoId, knownTitles,
-  actionBars, grantableLevels, "order", creation_date, deleteInfos_Account, deleteInfos_Name, deleteDate, innTriggerId,
-  extraBonusTalentCount`;
+/** `LOGIN_UPD_LOGONPROOF` part the realm list needs: the session key, login time, and online flag. */
+export async function saveSessionKey(db: Db, username: string, sessionKey: Uint8Array): Promise<void> {
+  await db.update(account).set({ session_key: sessionKey, last_login: new Date(), online: 1 }).where(eq(account.username, username));
+}
+
+export async function findCharacter(db: Db, accountId: number, characterId: number): Promise<Character | null> {
+  const [row] = await db
+    .select()
+    .from(characters)
+    .where(and(eq(characters.guid, characterId), eq(characters.account, accountId)));
+  return row ?? null;
+}
+
+export async function findCharacterById(db: Db, characterId: number): Promise<Character | null> {
+  const [row] = await db.select().from(characters).where(eq(characters.guid, characterId));
+  return row ?? null;
+}
+
+export async function listCharacters(db: Db, accountId: number): Promise<Character[]> {
+  return db.select().from(characters).where(eq(characters.account, accountId)).orderBy(asc(characters.guid));
+}
+
+export async function listRealms(db: Db): Promise<Realm[]> {
+  return db.select().from(realmlist).orderBy(asc(realmlist.id));
+}
+
+/** `RealmFlags` (Realm.h) */
+export const REALM_FLAG_VERSION_MISMATCH = 0x01;
+export const REALM_FLAG_OFFLINE = 0x02;
+
+/** worldserver `Main`: while loading the realm is not offline but not connectable yet (`REALM_FLAG_VERSION_MISMATCH`). */
+export async function markRealmStarting(db: Db, realmId: number): Promise<void> {
+  await db
+    .update(realmlist)
+    .set({ flag: sql`(${realmlist.flag} & ~${REALM_FLAG_OFFLINE}) | ${REALM_FLAG_VERSION_MISMATCH}` })
+    .where(eq(realmlist.id, realmId));
+}
+
+/** worldserver `Main`: the world is up, so the realm is connectable (`population = 0`). */
+export async function markRealmOnline(db: Db, realmId: number): Promise<void> {
+  await db
+    .update(realmlist)
+    .set({ flag: sql`${realmlist.flag} & ~${REALM_FLAG_VERSION_MISMATCH}`, population: 0 })
+    .where(eq(realmlist.id, realmId));
+}
+
+/** worldserver `Main` at shutdown: set server offline. */
+export async function markRealmOffline(db: Db, realmId: number): Promise<void> {
+  await db
+    .update(realmlist)
+    .set({ flag: sql`${realmlist.flag} | ${REALM_FLAG_OFFLINE}` })
+    .where(eq(realmlist.id, realmId));
+}
 
 /**
- * `bun:sqlite` runs on the event loop thread, where AzerothCore has async database workers.
- * WAL with `synchronous = NORMAL` keeps each commit off `fsync`, so saves do not stall the loop.
+ * Development accounts `TEST`, `TEST2`, and `TEST3`, each with a level 1 human warrior in Northshire. Rows that
+ * already exist stay as they are. The realm comes from the `realmlist` row in `sql/base/db_auth`.
  */
-export function openAuthDatabase(path: string): Database {
-  const db = new Database(path, { create: true, strict: true });
-  db.run("PRAGMA journal_mode = WAL");
-  db.run("PRAGMA synchronous = NORMAL");
-  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
-  db.run("PRAGMA foreign_keys = ON");
-  db.exec(SCHEMA);
-  ensureCharacterTables(db);
-  seed(db);
-  return db;
-}
-
-export function findAccount(db: Database, username: string): Account | null {
-  return db.query<Account, { username: string }>(`SELECT ${ACCOUNT_COLUMNS} FROM account WHERE username = $username`).get({ username }) ?? null;
-}
-
-export function saveSessionKey(db: Database, username: string, sessionKey: Uint8Array): void {
-  db.query(
-    "UPDATE account SET session_key = $session_key, last_login = CURRENT_TIMESTAMP, online = 1 WHERE username = $username",
-  ).run({
-    session_key: sessionKey,
-    username,
-  });
-}
-
-export function findCharacter(db: Database, accountId: number, characterId: number): Character | null {
-  return (
-    db
-      .query<Character, { guid: number; account: number }>(
-        `SELECT ${CHARACTER_COLUMNS} FROM characters WHERE guid = $guid AND account = $account`,
-      )
-      .get({ guid: characterId, account: accountId }) ?? null
-  );
-}
-
-export function findCharacterById(db: Database, characterId: number): Character | null {
-  return (
-    db.query<Character, { guid: number }>(`SELECT ${CHARACTER_COLUMNS} FROM characters WHERE guid = $guid`).get({ guid: characterId }) ??
-    null
-  );
-}
-
-export function listCharacters(db: Database, accountId: number): Character[] {
-  return db
-    .query<Character, { account: number }>(`SELECT ${CHARACTER_COLUMNS} FROM characters WHERE account = $account ORDER BY guid`)
-    .all({ account: accountId });
-}
-
-export function listRealms(db: Database): Realm[] {
-  return db
-    .query<Realm, []>(
-      `SELECT id, name, address, localAddress, localSubnetMask, port, icon, flag, timezone, allowedSecurityLevel, population, gamebuild
-       FROM realmlist ORDER BY id`,
-    )
-    .all();
-}
-
-function seed(db: Database): void {
-  db.transaction(() => {
-    const realms = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM realmlist").get();
-    if (realms?.count === 0) {
-      db.query(
-        `INSERT INTO realmlist (name, address, localAddress, localSubnetMask, port, icon, flag, timezone, allowedSecurityLevel, population, gamebuild)
-         VALUES ($name, $address, $localAddress, $localSubnetMask, $port, $icon, $flag, $timezone, $allowedSecurityLevel, $population, $gamebuild)`,
-      ).run({
-        name: "Azeroth",
-        address: REALM_ADDRESS,
-        localAddress: REALM_ADDRESS,
-        localSubnetMask: "255.255.255.0",
-        port: REALM_PORT,
-        icon: 0,
-        flag: 0,
-        timezone: 1,
-        allowedSecurityLevel: 0,
-        population: 0,
-        gamebuild: CLIENT_BUILD,
-      });
+export async function seedDevelopmentAccounts(loginDb: Db, characterDb: Db, world: WorldTables | null): Promise<void> {
+  for (const seed of SEED_ACCOUNTS) {
+    let [found] = await loginDb.select({ id: account.id }).from(account).where(eq(account.username, seed.username));
+    if (!found) {
+      const registration = makeRegistrationData(seed.username, seed.password);
+      await loginDb.insert(account).values({ username: seed.username, salt: registration.salt, verifier: registration.verifier });
+      [found] = await loginDb.select({ id: account.id }).from(account).where(eq(account.username, seed.username));
     }
-    for (const seed of SEED_ACCOUNTS) {
-      let account = db.query<{ id: number }, { username: string }>("SELECT id FROM account WHERE username = $username").get({
-        username: seed.username,
-      });
-      if (!account) {
-        const registration = makeRegistrationData(seed.username, seed.password);
-        db.query("INSERT INTO account (username, salt, verifier) VALUES ($username, $salt, $verifier)").run({
-          username: seed.username,
-          salt: registration.salt,
-          verifier: registration.verifier,
-        });
-        account = db.query<{ id: number }, { username: string }>("SELECT id FROM account WHERE username = $username").get({
-          username: seed.username,
-        });
-      }
-      if (!account) {
-        continue;
-      }
-      const existing = db.query<{ count: number }, { account: number }>("SELECT COUNT(*) AS count FROM characters WHERE account = $account").get({
-        account: account.id,
-      });
-      if (existing?.count === 0) {
-        db.query(
-          `INSERT INTO characters (
-             account, name, race, class, gender, level, skin, face, hairStyle, hairColor, facialStyle,
-             position_x, position_y, position_z, map, zone, health, taximask, innTriggerId
-           ) VALUES (
-             $account, $name, $race, $class, $gender, $level, $skin, $face, $hairStyle, $hairColor, $facialStyle,
-             $position_x, $position_y, $position_z, $map, $zone, $health, $taximask, $innTriggerId
-           )`,
-        ).run({
-          account: account.id,
-          name: seed.character.name,
-          race: 1,
-          class: 1,
-          gender: seed.character.gender,
-          level: 1,
-          skin: seed.character.skin,
-          face: seed.character.face,
-          hairStyle: seed.character.hairStyle,
-          hairColor: seed.character.hairColor,
-          facialStyle: seed.character.facialStyle,
-          position_x: -8949.95,
-          position_y: seed.character.position_y,
-          position_z: 83.5312,
-          map: 0,
-          zone: 12,
-          health: 60,
-          taximask: "",
-          innTriggerId: 0,
-        });
-      }
-      db.query(
-        `INSERT INTO realmcharacters (realmid, acctid, numchars)
-         VALUES (1, $acctid, (SELECT COUNT(*) FROM characters WHERE account = $acctid))
-         ON CONFLICT(realmid, acctid) DO UPDATE SET numchars = excluded.numchars`,
-      ).run({ acctid: account.id });
+    if (!found) {
+      continue;
     }
-  })();
+    const accountId = found.id;
+    const existing = await characterDb.$count(characters, eq(characters.account, accountId));
+    if (existing === 0) {
+      const guid = objectGuids.player.generate();
+      await characterDb.insert(characters).values({
+        guid,
+        account: accountId,
+        name: seed.character.name,
+        race: 1,
+        class: 1,
+        gender: seed.character.gender,
+        level: 1,
+        skin: seed.character.skin,
+        face: seed.character.face,
+        hairStyle: seed.character.hairStyle,
+        hairColor: seed.character.hairColor,
+        facialStyle: seed.character.facialStyle,
+        position_x: -8949.95,
+        position_y: seed.character.position_y,
+        position_z: 83.5312,
+        map: 0,
+        zone: 12,
+        health: 60,
+        money: seed.character.money ?? 0,
+        taximask: "",
+        innTriggerId: 0,
+      });
+      if (seed.character.bag) {
+        await seedBackpack(characterDb, world, guid, seed.character.bag);
+      }
+    } else if (seed.character.bag) {
+      const [character] = await characterDb
+        .select({ guid: characters.guid })
+        .from(characters)
+        .where(and(eq(characters.account, accountId), eq(characters.name, seed.character.name)));
+      if (character && (await characterDb.$count(character_inventory, eq(character_inventory.guid, character.guid))) === 0) {
+        await seedBackpack(characterDb, world, character.guid, seed.character.bag);
+        if (seed.character.money !== undefined) {
+          await characterDb.update(characters).set({ money: seed.character.money }).where(eq(characters.guid, character.guid));
+        }
+      }
+    }
+    await refreshRealmCharacterCount(characterDb, loginDb, accountId);
+  }
 }
 
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS account (
-    id INTEGER PRIMARY KEY,
-    username TEXT NOT NULL DEFAULT '',
-    salt BLOB NOT NULL,
-    verifier BLOB NOT NULL,
-    session_key BLOB,
-    totp_secret BLOB,
-    email TEXT NOT NULL DEFAULT '',
-    reg_mail TEXT NOT NULL DEFAULT '',
-    joindate TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_ip TEXT NOT NULL DEFAULT '127.0.0.1',
-    last_attempt_ip TEXT NOT NULL DEFAULT '127.0.0.1',
-    failed_logins INTEGER NOT NULL DEFAULT 0,
-    locked INTEGER NOT NULL DEFAULT 0,
-    lock_country TEXT NOT NULL DEFAULT '00',
-    last_login TEXT,
-    online INTEGER NOT NULL DEFAULT 0,
-    expansion INTEGER NOT NULL DEFAULT 2,
-    Flags INTEGER NOT NULL DEFAULT 0,
-    mutetime INTEGER NOT NULL DEFAULT 0,
-    mutereason TEXT NOT NULL DEFAULT '',
-    muteby TEXT NOT NULL DEFAULT '',
-    locale INTEGER NOT NULL DEFAULT 0,
-    os TEXT NOT NULL DEFAULT '',
-    recruiter INTEGER NOT NULL DEFAULT 0,
-    totaltime INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_username ON account (username);
-
-  CREATE TABLE IF NOT EXISTS account_access (
-    id INTEGER NOT NULL,
-    gmlevel INTEGER NOT NULL,
-    RealmID INTEGER NOT NULL DEFAULT -1,
-    comment TEXT DEFAULT '',
-    PRIMARY KEY (id, RealmID)
-  );
-
-  CREATE TABLE IF NOT EXISTS account_banned (
-    id INTEGER NOT NULL DEFAULT 0,
-    bandate INTEGER NOT NULL DEFAULT 0,
-    unbandate INTEGER NOT NULL DEFAULT 0,
-    bannedby TEXT NOT NULL,
-    banreason TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (id, bandate)
-  );
-
-  CREATE TABLE IF NOT EXISTS account_muted (
-    guid INTEGER NOT NULL DEFAULT 0,
-    mutedate INTEGER NOT NULL DEFAULT 0,
-    mutetime INTEGER NOT NULL DEFAULT 0,
-    mutedby TEXT NOT NULL,
-    mutereason TEXT NOT NULL,
-    PRIMARY KEY (guid, mutedate)
-  );
-
-  CREATE TABLE IF NOT EXISTS autobroadcast (
-    realmid INTEGER NOT NULL DEFAULT -1,
-    id INTEGER NOT NULL,
-    weight INTEGER DEFAULT 1,
-    text TEXT NOT NULL,
-    PRIMARY KEY (id, realmid)
-  );
-
-  CREATE TABLE IF NOT EXISTS autobroadcast_locale (
-    realmid INTEGER NOT NULL,
-    id INTEGER NOT NULL,
-    locale TEXT NOT NULL,
-    text TEXT NOT NULL,
-    PRIMARY KEY (realmid, id, locale)
-  );
-
-  CREATE TABLE IF NOT EXISTS build_info (
-    build INTEGER PRIMARY KEY,
-    majorVersion INTEGER,
-    minorVersion INTEGER,
-    bugfixVersion INTEGER,
-    hotfixVersion TEXT,
-    winAuthSeed TEXT,
-    win64AuthSeed TEXT,
-    mac64AuthSeed TEXT,
-    winChecksumSeed TEXT,
-    macChecksumSeed TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS ip_banned (
-    ip TEXT NOT NULL DEFAULT '127.0.0.1',
-    bandate INTEGER NOT NULL,
-    unbandate INTEGER NOT NULL,
-    bannedby TEXT NOT NULL DEFAULT '[Console]',
-    banreason TEXT NOT NULL DEFAULT 'no reason',
-    PRIMARY KEY (ip, bandate)
-  );
-
-  CREATE TABLE IF NOT EXISTS logs (
-    time INTEGER NOT NULL,
-    realm INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    level INTEGER NOT NULL DEFAULT 0,
-    string TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS logs_ip_actions (
-    id INTEGER PRIMARY KEY,
-    account_id INTEGER NOT NULL,
-    character_guid INTEGER NOT NULL,
-    type INTEGER NOT NULL,
-    ip TEXT NOT NULL DEFAULT '127.0.0.1',
-    systemnote TEXT,
-    unixtime INTEGER NOT NULL,
-    time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    comment TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS motd (
-    realmid INTEGER PRIMARY KEY,
-    text TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS motd_localized (
-    realmid INTEGER NOT NULL,
-    locale TEXT NOT NULL,
-    text TEXT,
-    PRIMARY KEY (realmid, locale)
-  );
-
-  CREATE TABLE IF NOT EXISTS rbac_permissions (
-    id INTEGER NOT NULL DEFAULT 0 PRIMARY KEY,
-    name TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS rbac_account_permissions (
-    accountId INTEGER NOT NULL,
-    permissionId INTEGER NOT NULL,
-    granted INTEGER NOT NULL DEFAULT 1,
-    realmId INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (accountId, permissionId, realmId),
-    FOREIGN KEY (accountId) REFERENCES account (id) ON DELETE CASCADE,
-    FOREIGN KEY (permissionId) REFERENCES rbac_permissions (id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS rbac_default_permissions (
-    secId INTEGER NOT NULL,
-    permissionId INTEGER NOT NULL,
-    realmId INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (secId, permissionId, realmId),
-    FOREIGN KEY (permissionId) REFERENCES rbac_permissions (id)
-  );
-
-  CREATE TABLE IF NOT EXISTS rbac_linked_permissions (
-    id INTEGER NOT NULL,
-    linkedId INTEGER NOT NULL,
-    PRIMARY KEY (id, linkedId),
-    FOREIGN KEY (id) REFERENCES rbac_permissions (id) ON DELETE CASCADE,
-    FOREIGN KEY (linkedId) REFERENCES rbac_permissions (id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS realmcharacters (
-    realmid INTEGER NOT NULL DEFAULT 0,
-    acctid INTEGER NOT NULL,
-    numchars INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (realmid, acctid)
-  );
-  CREATE INDEX IF NOT EXISTS idx_realmcharacters_acctid ON realmcharacters (acctid);
-
-  CREATE TABLE IF NOT EXISTS realmlist (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL DEFAULT '',
-    address TEXT NOT NULL DEFAULT '127.0.0.1',
-    localAddress TEXT NOT NULL DEFAULT '127.0.0.1',
-    localSubnetMask TEXT NOT NULL DEFAULT '255.255.255.0',
-    port INTEGER NOT NULL DEFAULT 8085,
-    icon INTEGER NOT NULL DEFAULT 0,
-    flag INTEGER NOT NULL DEFAULT 2,
-    timezone INTEGER NOT NULL DEFAULT 0,
-    allowedSecurityLevel INTEGER NOT NULL DEFAULT 0,
-    population REAL NOT NULL DEFAULT 0 CHECK (population >= 0),
-    gamebuild INTEGER NOT NULL DEFAULT 12340
-  );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_realmlist_name ON realmlist (name);
-
-  CREATE TABLE IF NOT EXISTS secret_digest (
-    id INTEGER PRIMARY KEY,
-    digest TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS updates (
-    name TEXT PRIMARY KEY,
-    hash TEXT DEFAULT '',
-    state TEXT NOT NULL DEFAULT 'RELEASED',
-    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    speed INTEGER NOT NULL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS updates_include (
-    path TEXT PRIMARY KEY,
-    state TEXT NOT NULL DEFAULT 'RELEASED'
-  );
-
-  CREATE TABLE IF NOT EXISTS uptime (
-    realmid INTEGER NOT NULL,
-    starttime INTEGER NOT NULL DEFAULT 0,
-    uptime INTEGER NOT NULL DEFAULT 0,
-    maxplayers INTEGER NOT NULL DEFAULT 0,
-    revision TEXT NOT NULL DEFAULT 'AzerothCore',
-    PRIMARY KEY (realmid, starttime)
-  );
-
-  CREATE TABLE IF NOT EXISTS characters (
-    guid INTEGER PRIMARY KEY,
-    account INTEGER NOT NULL DEFAULT 0,
-    name TEXT NOT NULL,
-    race INTEGER NOT NULL DEFAULT 0,
-    class INTEGER NOT NULL DEFAULT 0,
-    gender INTEGER NOT NULL DEFAULT 0,
-    level INTEGER NOT NULL DEFAULT 0,
-    xp INTEGER NOT NULL DEFAULT 0,
-    money INTEGER NOT NULL DEFAULT 0,
-    skin INTEGER NOT NULL DEFAULT 0,
-    face INTEGER NOT NULL DEFAULT 0,
-    hairStyle INTEGER NOT NULL DEFAULT 0,
-    hairColor INTEGER NOT NULL DEFAULT 0,
-    facialStyle INTEGER NOT NULL DEFAULT 0,
-    bankSlots INTEGER NOT NULL DEFAULT 0,
-    restState INTEGER NOT NULL DEFAULT 0,
-    playerFlags INTEGER NOT NULL DEFAULT 0,
-    position_x REAL NOT NULL DEFAULT 0,
-    position_y REAL NOT NULL DEFAULT 0,
-    position_z REAL NOT NULL DEFAULT 0,
-    map INTEGER NOT NULL DEFAULT 0,
-    instance_id INTEGER NOT NULL DEFAULT 0,
-    instance_mode_mask INTEGER NOT NULL DEFAULT 0,
-    orientation REAL NOT NULL DEFAULT 0,
-    taximask TEXT NOT NULL,
-    online INTEGER NOT NULL DEFAULT 0,
-    cinematic INTEGER NOT NULL DEFAULT 0,
-    totaltime INTEGER NOT NULL DEFAULT 0,
-    leveltime INTEGER NOT NULL DEFAULT 0,
-    logout_time INTEGER NOT NULL DEFAULT 0,
-    is_logout_resting INTEGER NOT NULL DEFAULT 0,
-    rest_bonus REAL NOT NULL DEFAULT 0,
-    resettalents_cost INTEGER NOT NULL DEFAULT 0,
-    resettalents_time INTEGER NOT NULL DEFAULT 0,
-    trans_x REAL NOT NULL DEFAULT 0,
-    trans_y REAL NOT NULL DEFAULT 0,
-    trans_z REAL NOT NULL DEFAULT 0,
-    trans_o REAL NOT NULL DEFAULT 0,
-    transguid INTEGER DEFAULT 0,
-    extra_flags INTEGER NOT NULL DEFAULT 0,
-    stable_slots INTEGER NOT NULL DEFAULT 0,
-    at_login INTEGER NOT NULL DEFAULT 0,
-    zone INTEGER NOT NULL DEFAULT 0,
-    death_expire_time INTEGER NOT NULL DEFAULT 0,
-    taxi_path TEXT,
-    arenaPoints INTEGER NOT NULL DEFAULT 0,
-    totalHonorPoints INTEGER NOT NULL DEFAULT 0,
-    todayHonorPoints INTEGER NOT NULL DEFAULT 0,
-    yesterdayHonorPoints INTEGER NOT NULL DEFAULT 0,
-    totalKills INTEGER NOT NULL DEFAULT 0,
-    todayKills INTEGER NOT NULL DEFAULT 0,
-    yesterdayKills INTEGER NOT NULL DEFAULT 0,
-    chosenTitle INTEGER NOT NULL DEFAULT 0,
-    knownCurrencies INTEGER NOT NULL DEFAULT 0,
-    watchedFaction INTEGER NOT NULL DEFAULT 0,
-    drunk INTEGER NOT NULL DEFAULT 0,
-    health INTEGER NOT NULL DEFAULT 0,
-    power1 INTEGER NOT NULL DEFAULT 0,
-    power2 INTEGER NOT NULL DEFAULT 0,
-    power3 INTEGER NOT NULL DEFAULT 0,
-    power4 INTEGER NOT NULL DEFAULT 0,
-    power5 INTEGER NOT NULL DEFAULT 0,
-    power6 INTEGER NOT NULL DEFAULT 0,
-    power7 INTEGER NOT NULL DEFAULT 0,
-    latency INTEGER DEFAULT 0,
-    talentGroupsCount INTEGER NOT NULL DEFAULT 1,
-    activeTalentGroup INTEGER NOT NULL DEFAULT 0,
-    exploredZones TEXT,
-    equipmentCache TEXT,
-    ammoId INTEGER NOT NULL DEFAULT 0,
-    knownTitles TEXT,
-    actionBars INTEGER NOT NULL DEFAULT 0,
-    grantableLevels INTEGER NOT NULL DEFAULT 0,
-    "order" INTEGER,
-    creation_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleteInfos_Account INTEGER,
-    deleteInfos_Name TEXT,
-    deleteDate INTEGER,
-    innTriggerId INTEGER NOT NULL,
-    extraBonusTalentCount INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE INDEX IF NOT EXISTS idx_account ON characters (account);
-  CREATE INDEX IF NOT EXISTS idx_online ON characters (online);
-  CREATE INDEX IF NOT EXISTS idx_name ON characters (name);
-`;
+async function seedBackpack(
+  db: Db,
+  world: WorldTables | null,
+  characterGuid: number,
+  items: NonNullable<SeedAccount["character"]["bag"]>,
+): Promise<void> {
+  for (const item of items) {
+    const created = await createItem(db, world, {
+      entry: item.entry,
+      owner: characterGuid,
+      count: item.count,
+      charges: "charges" in item ? item.charges : undefined,
+      durability: "durability" in item ? item.durability : undefined,
+      maxDurability: "maxDurability" in item ? item.maxDurability : undefined,
+    });
+    await db.insert(character_inventory).values({ guid: characterGuid, bag: 0, slot: item.slot, item: created.guid });
+  }
+}

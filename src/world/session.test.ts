@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import type { Socket } from "bun";
 import { ByteWriter } from "../net/byte-buffer.ts";
 import { WorldCrypt } from "../crypto/world-crypt.ts";
-import { findCharacterById, openAuthDatabase, saveSessionKey } from "../db.ts";
+import { seededTestDatabases } from "../database/test-db.ts";
+import { findCharacterById, saveSessionKey } from "../db.ts";
 import {
   AUTH_OK,
   authSeed,
@@ -16,7 +17,7 @@ import {
   SMSG_CHAR_ENUM,
   SMSG_LOGIN_VERIFY_WORLD,
   SMSG_PONG,
-  SMSG_LOGOUT_COMPLETE,
+  SMSG_LOGOUT_RESPONSE,
   SMSG_NAME_QUERY_RESPONSE,
   SMSG_QUERY_TIME_RESPONSE,
   SMSG_UPDATE_OBJECT,
@@ -25,7 +26,10 @@ import {
   CMSG_QUERY_TIME,
   CMSG_STANDSTATECHANGE,
   SMSG_STANDSTATE_UPDATE,
+  SMSG_TUTORIAL_FLAGS,
+  CMSG_TUTORIAL_FLAG,
 } from "./packets.ts";
+import { loadTutorials } from "../characters/tutorials.ts";
 import { ConfigMgr, ConfigSeverity, defaultConfigPolicy } from "../common/config.ts";
 import { ServerConfig, WorldConfig } from "../game/world/world-config.ts";
 import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
@@ -34,8 +38,8 @@ import { startWorldServer, timeOutTimeSeconds } from "./server.ts";
 test("authenticated client receives the seeded character", async () => {
   const sessionKey = new Uint8Array(40);
   crypto.getRandomValues(sessionKey);
-  const db = openAuthDatabase(":memory:");
-  saveSessionKey(db, "TEST", sessionKey);
+  const db = await seededTestDatabases();
+  await saveSessionKey(db.login, "TEST", sessionKey);
   const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db });
   const client = await connect(server.port ?? 0);
 
@@ -56,6 +60,9 @@ test("authenticated client receives the seeded character", async () => {
   expect(response.payload[0]).toBe(AUTH_OK);
   await readServerPacket(client, crypt);
   await readServerPacket(client, crypt);
+  const tutorials = await readServerPacket(client, crypt);
+  expect(tutorials.opcode).toBe(SMSG_TUTORIAL_FLAGS);
+  expect(tutorials.payload).toEqual(new Uint8Array(32));
 
   client.send(encodeClientPacket(CMSG_CHAR_ENUM, new Uint8Array(0), crypt));
   const characters = await readServerPacket(client, crypt);
@@ -70,7 +77,7 @@ test("authenticated client receives the seeded character", async () => {
 
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array(), crypt));
   const entered = new Map<number, Uint8Array>();
-  for (let index = 0; index < 17; index++) {
+  for (let index = 0; index < 16; index++) {
     const packet = await readServerPacket(client, crypt);
     entered.set(packet.opcode, packet.payload);
   }
@@ -112,13 +119,16 @@ test("authenticated client receives the seeded character", async () => {
   const stood = await readUntil(client, crypt, new Set([SMSG_STANDSTATE_UPDATE]));
   expect(stood.get(SMSG_STANDSTATE_UPDATE)?.[0]).toBe(0);
 
+  client.send(encodeClientPacket(CMSG_TUTORIAL_FLAG, new ByteWriter().writeU32(34).toUint8Array(), crypt));
   client.send(encodeClientPacket(0x0ee, movement(1n, -8900, -100, 84), crypt));
   client.send(encodeClientPacket(CMSG_LOGOUT_REQUEST, new Uint8Array(0), crypt));
-  const logout = await readUntil(client, crypt, new Set([SMSG_LOGOUT_COMPLETE]));
-  expect(logout.has(SMSG_LOGOUT_COMPLETE)).toBe(true);
-  const saved = findCharacterById(db, 1);
+  const logout = await readUntil(client, crypt, new Set([SMSG_LOGOUT_RESPONSE]));
+  const logoutBody = logout.get(SMSG_LOGOUT_RESPONSE);
+  expect(logoutBody?.[4]).toBe(0);
+  const saved = await findCharacterById(db.characters, 1);
   expect(saved?.position_x).toBeCloseTo(-8900);
   expect(saved?.position_z).toBeCloseTo(84);
+  expect((await loadTutorials(db.characters, saved!.account)).values[1]).toBe(1 << 2);
 
   client.close();
   server.stop(true);
@@ -126,8 +136,8 @@ test("authenticated client receives the seeded character", async () => {
 
 test("a dropped connection saves the character like LogoutPlayer(true)", async () => {
   const sessionKey = crypto.getRandomValues(new Uint8Array(40));
-  const db = openAuthDatabase(":memory:");
-  saveSessionKey(db, "TEST", sessionKey);
+  const db = await seededTestDatabases();
+  await saveSessionKey(db.login, "TEST", sessionKey);
   const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db });
   const client = await connect(server.port ?? 0);
   const challenge = await readServerPacket(client, null);
@@ -140,20 +150,22 @@ test("a dropped connection saves the character like LogoutPlayer(true)", async (
     ),
   );
   const crypt = new WorldCrypt(sessionKey, "client");
-  await readServerPacket(client, crypt);
-  await readServerPacket(client, crypt);
-  await readServerPacket(client, crypt);
+  await readUntil(client, crypt, new Set([SMSG_TUTORIAL_FLAGS]));
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array(), crypt));
   await readUntil(client, crypt, new Set([SMSG_LOGIN_VERIFY_WORLD]));
 
   client.send(encodeClientPacket(0x0b5, movement(1n, -8800, -120, 84, 0x1), crypt));
   client.send(encodeClientPacket(CMSG_PING, new ByteWriter().writeU32(1).writeU32(0).toUint8Array(), crypt));
   await readUntil(client, crypt, new Set([SMSG_PONG]));
-  expect(findCharacterById(db, 1)?.position_x).not.toBeCloseTo(-8800);
+  expect((await findCharacterById(db.characters, 1))?.position_x).not.toBeCloseTo(-8800);
 
   client.close();
-  await Bun.sleep(50);
-  expect(findCharacterById(db, 1)?.position_x).toBeCloseTo(-8800);
+  let savedX = 0;
+  for (let attempt = 0; attempt < 50 && Math.abs(savedX + 8800) > 0.01; attempt++) {
+    await Bun.sleep(20);
+    savedX = (await findCharacterById(db.characters, 1))?.position_x ?? 0;
+  }
+  expect(savedX).toBeCloseTo(-8800);
   server.stop(true);
 });
 
@@ -173,8 +185,8 @@ test(
   "an authenticated connection idle on character select is closed",
   async () => {
     const sessionKey = crypto.getRandomValues(new Uint8Array(40));
-    const db = openAuthDatabase(":memory:");
-    saveSessionKey(db, "TEST", sessionKey);
+    const db = await seededTestDatabases();
+    await saveSessionKey(db.login, "TEST", sessionKey);
     const settings = worldSettings();
     settings.overwrite(ServerConfig.CONFIG_SOCKET_TIMEOUTTIME, 1000);
     const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db, settings });
@@ -254,10 +266,17 @@ async function readUntil(client: TestClient, crypt: WorldCrypt, wanted: Set<numb
 type ServerPacket = { opcode: number; payload: Uint8Array; raw: Uint8Array };
 
 async function readServerPacket(client: TestClient, crypt: WorldCrypt | null): Promise<ServerPacket> {
-  const header = await client.read(4);
+  let header = await client.read(4);
   crypt?.decryptHeader(header);
-  const size = (header[0]! << 8) | header[1]!;
-  const opcode = header[2]! | (header[3]! << 8);
+  if ((header[0]! & 0x80) !== 0) {
+    // `ServerPktHeader` for packets over 0x7FFF bytes: a 3-byte size, decrypted as one stream with the rest.
+    const last = await client.read(1);
+    crypt?.decryptHeader(last);
+    header = Uint8Array.of(...header, last[0]!);
+  }
+  const large = header.length === 5;
+  const size = large ? ((header[0]! & 0x7f) << 16) | (header[1]! << 8) | header[2]! : (header[0]! << 8) | header[1]!;
+  const opcode = large ? header[3]! | (header[4]! << 8) : header[2]! | (header[3]! << 8);
   const payload = await client.read(size - 2);
   const raw = new Uint8Array(header.length + payload.length);
   raw.set(header, 0);

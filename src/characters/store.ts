@@ -1,5 +1,14 @@
-import type { Database } from "bun:sqlite";
-import { ensureQuestStatusTables } from "./quest-status.ts";
+import { and, asc, eq, sql } from "drizzle-orm";
+import { affectedRows, type Db, type DbExecutor } from "../database/database.ts";
+import {
+  character_action,
+  character_homebind,
+  character_reputation,
+  character_skills,
+  character_spell,
+  characters,
+} from "../database/schema/characters.ts";
+import { objectGuids } from "../game/globals/object-guids.ts";
 
 export type CharacterDraft = {
   accountId: number;
@@ -48,49 +57,7 @@ const NAME_MAX = 12;
 const NAME_MIN = 2;
 const ASCII_LETTER = /^[A-Za-z]+$/;
 
-export function ensureCharacterTables(db: Database): void {
-  ensureQuestStatusTables(db);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS character_spell (
-      guid INTEGER NOT NULL,
-      spell INTEGER NOT NULL,
-      specMask INTEGER NOT NULL DEFAULT 1,
-      PRIMARY KEY (guid, spell)
-    );
-    CREATE TABLE IF NOT EXISTS character_action (
-      guid INTEGER NOT NULL,
-      spec INTEGER NOT NULL DEFAULT 0,
-      button INTEGER NOT NULL,
-      action INTEGER NOT NULL,
-      type INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, spec, button)
-    );
-    CREATE TABLE IF NOT EXISTS character_skills (
-      guid INTEGER NOT NULL,
-      skill INTEGER NOT NULL,
-      value INTEGER NOT NULL,
-      max INTEGER NOT NULL,
-      PRIMARY KEY (guid, skill)
-    );
-    CREATE TABLE IF NOT EXISTS character_reputation (
-      guid INTEGER NOT NULL,
-      faction INTEGER NOT NULL,
-      standing INTEGER NOT NULL DEFAULT 0,
-      flags INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guid, faction)
-    );
-    CREATE TABLE IF NOT EXISTS character_homebind (
-      guid INTEGER NOT NULL PRIMARY KEY,
-      mapId INTEGER NOT NULL,
-      zoneId INTEGER NOT NULL,
-      posX REAL NOT NULL,
-      posY REAL NOT NULL,
-      posZ REAL NOT NULL
-    );
-  `);
-}
-
-export function checkCharacterName(db: Database, name: string): number {
+export async function checkCharacterName(db: Db, name: string): Promise<number> {
   if (name.length < NAME_MIN) {
     return CHAR_NAME_TOO_SHORT;
   }
@@ -108,107 +75,73 @@ export function checkCharacterName(db: Database, name: string): number {
     }
   }
 
-  const existing = db
-    .query<{ count: number }, { name: string }>(
-      "SELECT COUNT(*) AS count FROM characters WHERE lower(name) = lower($name)",
-    )
-    .get({ name });
-  if ((existing?.count ?? 0) > 0) {
+  const existing = await db.$count(characters, sql`lower(${characters.name}) = lower(${name})`);
+  if (existing > 0) {
     return CHAR_NAME_IN_USE;
   }
 
   return CHAR_NAME_OK;
 }
 
-export function createCharacter(db: Database, draft: CharacterDraft, kit: CharacterKit): number {
-  ensureCharacterTables(db);
-
-  const nameStatus = checkCharacterName(db, draft.name);
+/** The `characters` row and the starting kit rows, in one transaction. The guid is the next `HighGuid::Player`. */
+export async function createCharacter(db: Db, draft: CharacterDraft, kit: CharacterKit): Promise<number> {
+  const nameStatus = await checkCharacterName(db, draft.name);
   if (nameStatus !== CHAR_NAME_OK) {
     throw new Error(String(nameStatus));
   }
 
-  const insert = db.transaction(() => {
-    const result = db
-      .query(
-        `INSERT INTO characters (
-           account, name, race, class, gender, level, skin, face, hairStyle, hairColor, facialStyle,
-           position_x, position_y, position_z, map, zone, orientation, health
-         ) VALUES (
-           $account, $name, $race, $class, $gender, $level, $skin, $face, $hairStyle, $hairColor, $facialStyle,
-           $position_x, $position_y, $position_z, $map, $zone, $orientation, $health
-         )`,
-      )
-      .run({
-        account: draft.accountId,
-        name: draft.name,
-        race: draft.race,
-        class: draft.classId,
-        gender: draft.gender,
-        level: draft.level,
-        skin: draft.skin,
-        face: draft.face,
-        hairStyle: draft.hairStyle,
-        hairColor: draft.hairColor,
-        facialStyle: draft.facialStyle,
-        position_x: draft.x,
-        position_y: draft.y,
-        position_z: draft.z,
-        map: draft.map,
-        zone: draft.zone,
-        orientation: draft.orientation,
-        health: draft.health,
-      });
+  const guid = objectGuids.player.generate();
+  await db.transaction(async (tx) => {
+    await tx.insert(characters).values({
+      guid,
+      account: draft.accountId,
+      name: draft.name,
+      race: draft.race,
+      class: draft.classId,
+      gender: draft.gender,
+      level: draft.level,
+      skin: draft.skin,
+      face: draft.face,
+      hairStyle: draft.hairStyle,
+      hairColor: draft.hairColor,
+      facialStyle: draft.facialStyle,
+      position_x: draft.x,
+      position_y: draft.y,
+      position_z: draft.z,
+      map: draft.map,
+      zone: draft.zone,
+      orientation: draft.orientation,
+      health: draft.health,
+      taximask: "",
+      innTriggerId: 0,
+    });
+    await writeCharacterKit(tx, guid, kit);
+  });
+  return guid;
+}
 
-    const guid = Number(result.lastInsertRowid);
-
-    const insertSpell = db.query(
-      "INSERT INTO character_spell (guid, spell, specMask) VALUES ($guid, $spell, 1)",
-    );
-    for (const spell of kit.spells) {
-      insertSpell.run({ guid, spell });
-    }
-
-    const insertAction = db.query(
-      "INSERT INTO character_action (guid, spec, button, action, type) VALUES ($guid, 0, $button, $action, $type)",
-    );
-    for (const action of kit.actions) {
-      insertAction.run({
-        guid,
-        button: action.button,
-        action: action.action,
-        type: action.type,
-      });
-    }
-
-    const insertSkill = db.query(
-      "INSERT INTO character_skills (guid, skill, value, max) VALUES ($guid, $skill, $value, $max)",
-    );
-    for (const skill of kit.skills) {
-      insertSkill.run({
-        guid,
-        skill: skill.skill,
-        value: skill.value,
-        max: skill.max,
-      });
-    }
-
-    const insertFaction = db.query(
-      "INSERT INTO character_reputation (guid, faction, standing, flags) VALUES ($guid, $faction, $standing, $flags)",
-    );
-    for (const faction of kit.factions) {
-      insertFaction.run({
-        guid,
-        faction: faction.faction,
-        standing: faction.standing,
-        flags: faction.flags,
-      });
-    }
-
-    db.query(
-      `INSERT INTO character_homebind (guid, mapId, zoneId, posX, posY, posZ)
-       VALUES ($guid, $mapId, $zoneId, $posX, $posY, $posZ)`,
-    ).run({
+/** `character_spell`, `character_action`, `character_skills`, `character_reputation`, and `character_homebind` rows of a kit. */
+export async function writeCharacterKit(db: DbExecutor, guid: number, kit: CharacterKit | CharacterLoginKit): Promise<void> {
+  if (kit.spells.length > 0) {
+    await db.insert(character_spell).values(kit.spells.map((spell) => ({ guid, spell, specMask: 1 })));
+  }
+  if (kit.actions.length > 0) {
+    await db
+      .insert(character_action)
+      .values(kit.actions.map((action) => ({ guid, spec: 0, button: action.button, action: action.action, type: action.type })));
+  }
+  if (kit.skills.length > 0) {
+    await db
+      .insert(character_skills)
+      .values(kit.skills.map((skill) => ({ guid, skill: skill.skill, value: skill.value, max: skill.max })));
+  }
+  if (kit.factions.length > 0) {
+    await db
+      .insert(character_reputation)
+      .values(kit.factions.map((faction) => ({ guid, faction: faction.faction, standing: faction.standing, flags: faction.flags })));
+  }
+  if (kit.homebind) {
+    await db.insert(character_homebind).values({
       guid,
       mapId: kit.homebind.mapId,
       zoneId: kit.homebind.zoneId,
@@ -216,75 +149,62 @@ export function createCharacter(db: Database, draft: CharacterDraft, kit: Charac
       posY: kit.homebind.posY,
       posZ: kit.homebind.posZ,
     });
-
-    return guid;
-  });
-
-  return insert();
+  }
 }
 
-export function deleteCharacter(db: Database, accountId: number, guid: number): boolean {
-  ensureCharacterTables(db);
+/** Deletes the kit rows of a character (the tables `writeCharacterKit` fills). */
+export async function deleteCharacterKit(db: DbExecutor, guid: number): Promise<void> {
+  await db.delete(character_spell).where(eq(character_spell.guid, guid));
+  await db.delete(character_action).where(eq(character_action.guid, guid));
+  await db.delete(character_skills).where(eq(character_skills.guid, guid));
+  await db.delete(character_reputation).where(eq(character_reputation.guid, guid));
+  await db.delete(character_homebind).where(eq(character_homebind.guid, guid));
+}
 
-  const remove = db.transaction(() => {
-    const result = db
-      .query("DELETE FROM characters WHERE guid = $guid AND account = $account")
-      .run({ guid, account: accountId });
-    if (result.changes === 0) {
+export async function deleteCharacter(db: Db, accountId: number, guid: number): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const result = await tx.delete(characters).where(and(eq(characters.guid, guid), eq(characters.account, accountId)));
+    if (affectedRows(result) === 0) {
       return false;
     }
-
-    db.query("DELETE FROM character_spell WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_action WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_skills WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_reputation WHERE guid = $guid").run({ guid });
-    db.query("DELETE FROM character_homebind WHERE guid = $guid").run({ guid });
+    await deleteCharacterKit(tx, guid);
     return true;
   });
-
-  return remove();
 }
 
-export function loadCharacterKit(db: Database, guid: number): CharacterLoginKit {
-  ensureCharacterTables(db);
+export async function loadCharacterKit(db: Db, guid: number): Promise<CharacterLoginKit> {
+  const spells = (
+    await db.select({ spell: character_spell.spell }).from(character_spell).where(eq(character_spell.guid, guid)).orderBy(asc(character_spell.spell))
+  ).map((row) => row.spell);
 
-  const spells = db
-    .query<{ spell: number }, { guid: number }>(
-      "SELECT spell FROM character_spell WHERE guid = $guid ORDER BY spell",
-    )
-    .all({ guid })
-    .map((row) => row.spell);
+  const actions = await db
+    .select({ button: character_action.button, action: character_action.action, type: character_action.type })
+    .from(character_action)
+    .where(eq(character_action.guid, guid))
+    .orderBy(asc(character_action.button));
 
-  const actions = db
-    .query<{ button: number; action: number; type: number }, { guid: number }>(
-      "SELECT button, action, type FROM character_action WHERE guid = $guid ORDER BY button",
-    )
-    .all({ guid })
-    .map((row) => ({ button: row.button, action: row.action, type: row.type }));
+  const skills = await db
+    .select({ skill: character_skills.skill, value: character_skills.value, max: character_skills.max })
+    .from(character_skills)
+    .where(eq(character_skills.guid, guid))
+    .orderBy(asc(character_skills.skill));
 
-  const skills = db
-    .query<{ skill: number; value: number; max: number }, { guid: number }>(
-      "SELECT skill, value, max FROM character_skills WHERE guid = $guid ORDER BY skill",
-    )
-    .all({ guid })
-    .map((row) => ({ skill: row.skill, value: row.value, max: row.max }));
+  const factions = await db
+    .select({ faction: character_reputation.faction, standing: character_reputation.standing, flags: character_reputation.flags })
+    .from(character_reputation)
+    .where(eq(character_reputation.guid, guid))
+    .orderBy(asc(character_reputation.faction));
 
-  const factions = db
-    .query<{ faction: number; standing: number; flags: number }, { guid: number }>(
-      "SELECT faction, standing, flags FROM character_reputation WHERE guid = $guid ORDER BY faction",
-    )
-    .all({ guid })
-    .map((row) => ({ faction: row.faction, standing: row.standing, flags: row.flags }));
+  const [homebind] = await db
+    .select({
+      mapId: character_homebind.mapId,
+      zoneId: character_homebind.zoneId,
+      posX: character_homebind.posX,
+      posY: character_homebind.posY,
+      posZ: character_homebind.posZ,
+    })
+    .from(character_homebind)
+    .where(eq(character_homebind.guid, guid));
 
-  const homebind =
-    db
-      .query<
-        { mapId: number; zoneId: number; posX: number; posY: number; posZ: number },
-        { guid: number }
-      >(
-        "SELECT mapId, zoneId, posX, posY, posZ FROM character_homebind WHERE guid = $guid",
-      )
-      .get({ guid }) ?? null;
-
-  return { spells, actions, skills, factions, homebind };
+  return { spells, actions, skills, factions, homebind: homebind ?? null };
 }

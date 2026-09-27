@@ -1,8 +1,11 @@
-import type { Database } from "bun:sqlite";
 import type { Socket, TCPSocketListener } from "bun";
 import type { DbcStores } from "../data/dbc.ts";
+import type { SpellRecovery } from "../items/use-item.ts";
+import type { SpellStore } from "../spells/spell-info.ts";
+import type { ItemDbc } from "../items/item-dbc.ts";
 import type { WorldData } from "../data/world.ts";
-import { log } from "../log.ts";
+import { log, logDebug, logError, logPacket } from "../log.ts";
+import { worldOpcodeName } from "./opcodes.ts";
 import { SocketBuffers } from "../net/socket-buffers.ts";
 import { ServerConfig, type WorldConfig } from "../game/world/world-config.ts";
 import {
@@ -12,17 +15,64 @@ import {
   CMSG_PING,
   CMSG_WARDEN_DATA,
   decodeClientHeader,
+  sealServerPacket,
 } from "./packets.ts";
 import { QuestParty } from "./party.ts";
 import { PlayerView } from "./players.ts";
 import { indexSpawns, type SpawnIndex } from "./spawn.ts";
-import { describeWorldOpcode, WorldSession } from "./session.ts";
+import { describeWorldOpcode, WorldSession, type SessionDatabases } from "./session.ts";
+import type { PlayerEnvironment } from "../characters/player-env.ts";
+
+/** `WorldSessionMgr::UpdateSessions` — every connected session gets the world tick. */
+export class WorldSessions {
+  private readonly sessions = new Set<WorldSession>();
+
+  add(session: WorldSession): void {
+    this.sessions.add(session);
+  }
+
+  delete(session: WorldSession): void {
+    this.sessions.delete(session);
+  }
+
+  get size(): number {
+    return this.sessions.size;
+  }
+
+  private readonly logouts = new Set<Promise<void>>();
+
+  /** A closed socket's `LogoutPlayer` save; `drain` waits for it. */
+  trackLogout(logout: Promise<void>): void {
+    this.logouts.add(logout);
+    void logout.finally(() => this.logouts.delete(logout));
+  }
+
+  /** Waits for every logout save started so far (shutdown, before the pools close). */
+  async drain(): Promise<void> {
+    while (this.logouts.size > 0) {
+      await Promise.all([...this.logouts]);
+    }
+  }
+
+  update(diff: number): void {
+    for (const session of this.sessions) {
+      try {
+        session.update(diff);
+      } catch (error) {
+        const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+        log("world", `WorldSession::Update failed: ${message}`);
+      }
+    }
+  }
+}
 import { talkDataFor } from "./talk.ts";
 
 export type WorldSocketData = {
   session: WorldSession;
   io: SocketBuffers;
   header: { size: number; opcode: number } | null;
+  /** Packets are handled one at a time, in arrival order; the next waits for the previous database round trip. */
+  pumping: Promise<void>;
 };
 
 /**
@@ -53,12 +103,21 @@ export function timeOutTimeSeconds(
 export function startWorldServer(options: {
   hostname: string;
   port: number;
-  db: Database;
+  db: SessionDatabases;
   world?: WorldData | null;
   dbc?: DbcStores | null;
+  /** Spell.dbc recovery times for item cooldowns of -1. Shared across sessions. */
+  spellRecovery?: ReadonlyMap<number, SpellRecovery>;
+  spellStore?: SpellStore;
+  /** RandPropPoints, ItemRandomProperties, ItemRandomSuffix, and ItemLimitCategory. */
+  itemDbc?: ItemDbc;
   tcpNoDelay?: boolean;
   /** Source of the idle timeouts. Without it connections never time out. */
   settings?: WorldConfig;
+  /** Stat, skill, and regen tables shared by every player. */
+  playerEnv?: PlayerEnvironment;
+  /** Receives each session so the world tick can update it. */
+  sessions?: WorldSessions;
 }): TCPSocketListener<WorldSocketData> {
   const spawns: SpawnIndex | null = options.world ? indexSpawns(options.world) : null;
   if (options.world) {
@@ -75,16 +134,29 @@ export function startWorldServer(options: {
       open(socket) {
         socket.setNoDelay(tcpNoDelay);
         const io = new SocketBuffers(socket);
-        const session = new WorldSession(options.db, options.world ?? null, spawns, players, options.dbc ?? null, party);
-        session.attach((packet) => io.send(packet));
-        socket.data = { session, io, header: null };
+        const session = new WorldSession(
+          options.db,
+          options.world ?? null,
+          spawns,
+          players,
+          options.dbc ?? null,
+          party,
+          options.spellRecovery,
+          options.playerEnv,
+          options.spellStore,
+          options.itemDbc,
+        );
+        // `WorldSocket::SendPacket`: every packet reaches the socket, and its header cipher, in the order it is sent.
+        session.attach((packet) => io.send(sealServerPacket(packet, session.crypt)));
+        options.sessions?.add(session);
+        socket.data = { session, io, header: null, pumping: Promise.resolve() };
         log("world", `connection from ${socket.remoteAddress}`);
         log("world", "S->C SMSG_AUTH_CHALLENGE");
         io.send(session.greeting);
       },
       data(socket, data) {
         socket.data.io.receive(data);
-        pump(socket, options.settings);
+        schedulePump(socket, options.settings);
       },
       drain(socket) {
         socket.data.io.flush();
@@ -94,7 +166,15 @@ export function startWorldServer(options: {
         socket.data.io.close();
       },
       close(socket) {
-        socket.data?.session.disconnect();
+        if (socket.data) {
+          const { session } = socket.data;
+          options.sessions?.delete(session);
+          // `LogoutPlayer(true)` after any packet still in flight.
+          socket.data.pumping = socket.data.pumping
+            .then(() => session.disconnect())
+            .catch((error: unknown) => logError("world", `${session.label} logout failed`, error));
+          options.sessions?.trackLogout(socket.data.pumping);
+        }
         log("world", `connection closed ${socket.remoteAddress}`);
       },
       error(socket, error) {
@@ -112,7 +192,16 @@ function resetTimeOutTime(socket: Socket<WorldSocketData>, settings: WorldConfig
   }
 }
 
-function pump(socket: Socket<WorldSocketData>, settings: WorldConfig | undefined): void {
+function schedulePump(socket: Socket<WorldSocketData>, settings: WorldConfig | undefined): void {
+  socket.data.pumping = socket.data.pumping
+    .then(() => pump(socket, settings))
+    .catch((error: unknown) => {
+      logError("world", `${socket.data.session.label} packet pump failed`, error);
+      socket.data.io.close();
+    });
+}
+
+async function pump(socket: Socket<WorldSocketData>, settings: WorldConfig | undefined): Promise<void> {
   const state = socket.data;
   const { io, session } = state;
   while (io.open) {
@@ -143,16 +232,25 @@ function pump(socket: Socket<WorldSocketData>, settings: WorldConfig | undefined
     } else if (opcode !== CMSG_PING && opcode !== CMSG_AUTH_SESSION && opcode !== CMSG_WARDEN_DATA) {
       resetTimeOutTime(socket, settings, false);
     }
-    const result = session.handle(opcode, payload);
+    logPacket("C->S", worldOpcodeName(opcode), opcode, payload, session.label);
+    let result: Awaited<ReturnType<WorldSession["handle"]>>;
+    try {
+      result = await session.handle(opcode, payload);
+    } catch (error) {
+      logError("world", `${session.label} C->S ${describeWorldOpcode(opcode)} ${payload.length}b threw`, error);
+      continue;
+    }
     if (opcode === CMSG_AUTH_SESSION) {
       resetTimeOutTime(socket, settings, false);
     }
     const sent = result.sent.length > 0 ? ` -> ${result.sent.join(", ")}` : result.close ? " -> close" : " -> ignored";
     if (opcode !== CMSG_PING && !result.quiet) {
-      log("world", `C->S ${describeWorldOpcode(opcode)} ${payload.length}b${sent}`);
+      log("world", `${session.label} C->S ${describeWorldOpcode(opcode)} ${payload.length}b${sent}`);
+    } else if (opcode !== CMSG_PING) {
+      logDebug("world", () => `${session.label} C->S ${describeWorldOpcode(opcode)} ${payload.length}b${sent}`);
     }
     for (const packet of result.packets) {
-      io.send(packet);
+      io.send(sealServerPacket(packet, session.crypt));
     }
     if (result.close) {
       io.close();

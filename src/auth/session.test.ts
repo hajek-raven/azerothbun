@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import type { Socket } from "bun";
 import { ByteReader, ByteWriter } from "../net/byte-buffer.ts";
 import { clientLogonProof, reconnectProof, sessionVerifier } from "../crypto/srp6.ts";
-import { openAuthDatabase } from "../db.ts";
+import { testDatabases } from "../database/test-db.ts";
+import { seedDevelopmentAccounts } from "../db.ts";
 import {
   AUTH_LOGON_CHALLENGE,
   AUTH_LOGON_PROOF,
@@ -51,7 +52,8 @@ test("TEST logs in, sees the local realm, and can reconnect", async () => {
 
   client.send(realmListRequest());
   const realms = await readRealmList(client);
-  expect(realms).toContain("Azeroth");
+  // `realmlist` row 1 from sql/base/db_auth.
+  expect(realms).toContain("AzerothCore");
   expect(realms).toContain("127.0.0.1:8085");
 
   const reconnect = await connect(port);
@@ -130,10 +132,12 @@ type TestClient = {
 };
 
 async function listen(): Promise<number> {
+  const { login, characters } = await testDatabases();
+  await seedDevelopmentAccounts(login, characters, null);
   const server = startAuthServer({
     hostname: "127.0.0.1",
     port: 0,
-    db: openAuthDatabase(":memory:"),
+    db: login,
   });
   return server.port ?? 0;
 }

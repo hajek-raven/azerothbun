@@ -1,5 +1,7 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { testDatabase } from "../database/test-db.ts";
+import { characters } from "../database/schema/characters.ts";
 import {
   CHAR_NAME_IN_USE,
   CHAR_NAME_INVALID,
@@ -8,38 +10,19 @@ import {
   checkCharacterName,
   createCharacter,
   deleteCharacter,
-  ensureCharacterTables,
   loadCharacterKit,
   type CharacterDraft,
   type CharacterKit,
 } from "./store.ts";
 
-function openTestDb(): Database {
-  const db = new Database(":memory:", { strict: true });
-  db.exec(`
-    CREATE TABLE characters (
-      guid INTEGER PRIMARY KEY,
-      account INTEGER,
-      name TEXT,
-      race INTEGER,
-      class INTEGER,
-      gender INTEGER,
-      level INTEGER,
-      skin INTEGER,
-      face INTEGER,
-      hairStyle INTEGER,
-      hairColor INTEGER,
-      facialStyle INTEGER,
-      position_x REAL,
-      position_y REAL,
-      position_z REAL,
-      map INTEGER,
-      zone INTEGER,
-      orientation REAL,
-      health INTEGER
-    );
-  `);
-  return db;
+function openTestDb() {
+  return testDatabase("characters");
+}
+
+type TestDb = Awaited<ReturnType<typeof openTestDb>>;
+
+function characterCount(db: TestDb, guid?: number): Promise<number> {
+  return db.$count(characters, guid === undefined ? undefined : eq(characters.guid, guid));
 }
 
 function sampleDraft(overrides: Partial<CharacterDraft> = {}): CharacterDraft {
@@ -92,63 +75,35 @@ function sampleKit(overrides: Partial<CharacterKit> = {}): CharacterKit {
   };
 }
 
-describe("ensureCharacterTables", () => {
-  test("is idempotent", () => {
-    const db = openTestDb();
-    ensureCharacterTables(db);
-    ensureCharacterTables(db);
-    const tables = db
-      .query<{ name: string }, []>(
-        `SELECT name FROM sqlite_master
-         WHERE type = 'table'
-           AND name IN (
-             'character_spell', 'character_action', 'character_skills',
-             'character_reputation', 'character_homebind'
-           )
-         ORDER BY name`,
-      )
-      .all()
-      .map((row) => row.name);
-    expect(tables).toEqual([
-      "character_action",
-      "character_homebind",
-      "character_reputation",
-      "character_skills",
-      "character_spell",
-    ]);
-  });
-});
-
 describe("checkCharacterName", () => {
-  test("accepts a valid unused name", () => {
-    const db = openTestDb();
-    expect(checkCharacterName(db, "Thrall")).toBe(CHAR_NAME_OK);
+  test("accepts a valid unused name", async () => {
+    const db = await openTestDb();
+    expect(await checkCharacterName(db, "Thrall")).toBe(CHAR_NAME_OK);
   });
 
-  test("rejects a short name", () => {
-    const db = openTestDb();
-    expect(checkCharacterName(db, "A")).toBe(CHAR_NAME_TOO_SHORT);
+  test("rejects a short name", async () => {
+    const db = await openTestDb();
+    expect(await checkCharacterName(db, "A")).toBe(CHAR_NAME_TOO_SHORT);
   });
 
-  test("rejects three identical letters", () => {
-    const db = openTestDb();
-    expect(checkCharacterName(db, "Aaa")).toBe(CHAR_NAME_INVALID);
-    expect(checkCharacterName(db, "Booo")).toBe(CHAR_NAME_INVALID);
+  test("rejects three identical letters", async () => {
+    const db = await openTestDb();
+    expect(await checkCharacterName(db, "Aaa")).toBe(CHAR_NAME_INVALID);
+    expect(await checkCharacterName(db, "Booo")).toBe(CHAR_NAME_INVALID);
   });
 
-  test("rejects a duplicate name case-insensitively without inserting", () => {
-    const db = openTestDb();
-    createCharacter(db, sampleDraft({ name: "Thrall" }), sampleKit());
-    expect(checkCharacterName(db, "thrall")).toBe(CHAR_NAME_IN_USE);
-    expect(checkCharacterName(db, "THRALL")).toBe(CHAR_NAME_IN_USE);
-    const count = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM characters").get();
-    expect(count?.count).toBe(1);
+  test("rejects a duplicate name case-insensitively without inserting", async () => {
+    const db = await openTestDb();
+    await createCharacter(db, sampleDraft({ name: "Thrall" }), sampleKit());
+    expect(await checkCharacterName(db, "thrall")).toBe(CHAR_NAME_IN_USE);
+    expect(await checkCharacterName(db, "THRALL")).toBe(CHAR_NAME_IN_USE);
+    expect(await characterCount(db)).toBe(1);
   });
 });
 
 describe("createCharacter / loadCharacterKit", () => {
-  test("create then load roundtrip preserves kit and sorts rows", () => {
-    const db = openTestDb();
+  test("create then load roundtrip preserves kit and sorts rows", async () => {
+    const db = await openTestDb();
     const kit = sampleKit({
       spells: [81, 6603, 78],
       actions: [
@@ -166,10 +121,10 @@ describe("createCharacter / loadCharacterKit", () => {
       ],
     });
 
-    const guid = createCharacter(db, sampleDraft(), kit);
+    const guid = await createCharacter(db, sampleDraft(), kit);
     expect(guid).toBeGreaterThan(0);
 
-    const loaded = loadCharacterKit(db, guid);
+    const loaded = await loadCharacterKit(db, guid);
     expect(loaded.spells).toEqual([78, 81, 6603]);
     expect(loaded.actions).toEqual([
       { button: 0, action: 6603, type: 0 },
@@ -186,42 +141,34 @@ describe("createCharacter / loadCharacterKit", () => {
     ]);
     expect(loaded.homebind).toEqual(kit.homebind);
 
-    const row = db
-      .query<{ name: string; class: number; position_x: number }, { guid: number }>(
-        "SELECT name, class, position_x FROM characters WHERE guid = $guid",
-      )
-      .get({ guid });
+    const [row] = await db
+      .select({ name: characters.name, class: characters.class, position_x: characters.position_x })
+      .from(characters)
+      .where(eq(characters.guid, guid));
     expect(row).toEqual({ name: "Thrall", class: 1, position_x: -8949.95 });
   });
 
-  test("throws numeric code string when the name fails", () => {
-    const db = openTestDb();
-    expect(() => createCharacter(db, sampleDraft({ name: "A" }), sampleKit())).toThrow("1");
-    expect(() => createCharacter(db, sampleDraft({ name: "Aaa" }), sampleKit())).toThrow("3");
-    createCharacter(db, sampleDraft({ name: "Thrall" }), sampleKit());
-    expect(() => createCharacter(db, sampleDraft({ name: "thrall" }), sampleKit())).toThrow("4");
-    const count = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM characters").get();
-    expect(count?.count).toBe(1);
+  test("throws numeric code string when the name fails", async () => {
+    const db = await openTestDb();
+    await expect(createCharacter(db, sampleDraft({ name: "A" }), sampleKit())).rejects.toThrow("1");
+    await expect(createCharacter(db, sampleDraft({ name: "Aaa" }), sampleKit())).rejects.toThrow("3");
+    await createCharacter(db, sampleDraft({ name: "Thrall" }), sampleKit());
+    await expect(createCharacter(db, sampleDraft({ name: "thrall" }), sampleKit())).rejects.toThrow("4");
+    expect(await characterCount(db)).toBe(1);
   });
 
-  test("homebind stays fixed when characters position changes", () => {
-    const db = openTestDb();
+  test("homebind stays fixed when characters position changes", async () => {
+    const db = await openTestDb();
     const kit = sampleKit({
       homebind: { mapId: 0, zoneId: 12, posX: -8949.95, posY: -132.493, posZ: 83.5312 },
     });
-    const guid = createCharacter(db, sampleDraft({ x: -8949.95, y: -132.493, z: 83.5312 }), kit);
+    const guid = await createCharacter(db, sampleDraft({ x: -8949.95, y: -132.493, z: 83.5312 }), kit);
 
-    db.query("UPDATE characters SET position_x = $x WHERE guid = $guid").run({
-      guid,
-      x: -9000,
-    });
-
-    const position = db
-      .query<{ position_x: number }, { guid: number }>("SELECT position_x FROM characters WHERE guid = $guid")
-      .get({ guid });
+    await db.update(characters).set({ position_x: -9000 }).where(eq(characters.guid, guid));
+    const [position] = await db.select({ position_x: characters.position_x }).from(characters).where(eq(characters.guid, guid));
     expect(position?.position_x).toBe(-9000);
 
-    const loaded = loadCharacterKit(db, guid);
+    const loaded = await loadCharacterKit(db, guid);
     expect(loaded.homebind).toEqual({
       mapId: 0,
       zoneId: 12,
@@ -231,18 +178,11 @@ describe("createCharacter / loadCharacterKit", () => {
     });
   });
 
-  test("loadCharacterKit returns empty kit when child tables were missing", () => {
-    const db = openTestDb();
-    db.query(
-      `INSERT INTO characters (account, name, race, class, gender, level, skin, face, hairStyle, hairColor, facialStyle,
-        position_x, position_y, position_z, map, zone, orientation, health)
-       VALUES (1, 'Solo', 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 12, 0, 60)`,
-    ).run();
-    const guid = Number(
-      db.query<{ guid: number }, []>("SELECT guid FROM characters WHERE name = 'Solo'").get()?.guid,
-    );
+  test("loadCharacterKit returns empty kit when child tables were missing", async () => {
+    const db = await openTestDb();
+    await db.insert(characters).values({ guid: 9, account: 1, name: "Solo", race: 1, class: 1, level: 1, zone: 12, health: 60, taximask: "", innTriggerId: 0 });
 
-    const loaded = loadCharacterKit(db, guid);
+    const loaded = await loadCharacterKit(db, 9);
     expect(loaded).toEqual({
       spells: [],
       actions: [],
@@ -254,36 +194,24 @@ describe("createCharacter / loadCharacterKit", () => {
 });
 
 describe("deleteCharacter", () => {
-  test("deletes only the owning account's character and child rows", () => {
-    const db = openTestDb();
-    const guid = createCharacter(db, sampleDraft({ accountId: 1, name: "Mine" }), sampleKit());
-    const other = createCharacter(db, sampleDraft({ accountId: 2, name: "Theirs" }), sampleKit());
+  test("deletes only the owning account's character and child rows", async () => {
+    const db = await openTestDb();
+    const guid = await createCharacter(db, sampleDraft({ accountId: 1, name: "Mine" }), sampleKit());
+    const other = await createCharacter(db, sampleDraft({ accountId: 2, name: "Theirs" }), sampleKit());
 
-    expect(deleteCharacter(db, 2, guid)).toBe(false);
-    expect(loadCharacterKit(db, guid).spells.length).toBeGreaterThan(0);
-    expect(
-      db.query<{ count: number }, { guid: number }>("SELECT COUNT(*) AS count FROM characters WHERE guid = $guid").get({
-        guid,
-      })?.count,
-    ).toBe(1);
+    expect(await deleteCharacter(db, 2, guid)).toBe(false);
+    expect((await loadCharacterKit(db, guid)).spells.length).toBeGreaterThan(0);
+    expect(await characterCount(db, guid)).toBe(1);
 
-    expect(deleteCharacter(db, 1, guid)).toBe(true);
-    expect(
-      db.query<{ count: number }, { guid: number }>("SELECT COUNT(*) AS count FROM characters WHERE guid = $guid").get({
-        guid,
-      })?.count,
-    ).toBe(0);
-    expect(loadCharacterKit(db, guid)).toEqual({
+    expect(await deleteCharacter(db, 1, guid)).toBe(true);
+    expect(await characterCount(db, guid)).toBe(0);
+    expect(await loadCharacterKit(db, guid)).toEqual({
       spells: [],
       actions: [],
       skills: [],
       factions: [],
       homebind: null,
     });
-    expect(
-      db.query<{ count: number }, { guid: number }>("SELECT COUNT(*) AS count FROM characters WHERE guid = $guid").get({
-        guid: other,
-      })?.count,
-    ).toBe(1);
+    expect(await characterCount(db, other)).toBe(1);
   });
 });

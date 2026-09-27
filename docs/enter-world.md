@@ -6,11 +6,11 @@ After the realm list, the client connects to the world server on port **8085**. 
 
 1. Server sends `SMSG_AUTH_CHALLENGE`.
 2. Client sends `CMSG_AUTH_SESSION`. The server checks the account, build 12340, and the session digest.
-3. Server sends `SMSG_AUTH_RESPONSE`, addon info, and the client cache version.
+3. Server sends `SMSG_AUTH_RESPONSE`, addon info, the client cache version, and `SMSG_TUTORIAL_FLAGS` from `account_tutorial`.
 4. `CMSG_CHAR_ENUM` returns the account's characters. `CMSG_CHAR_CREATE` and `CMSG_CHAR_DELETE` create and delete one from `playercreateinfo`.
 5. `CMSG_PLAYER_LOGIN` sends the enter-world burst from `Player::SendInitialPacketsBeforeAddToMap` in AzerothCore:
    - `SMSG_LOGIN_VERIFY_WORLD` at the saved position
-   - account data times, feature status, dance moves, the `character_homebind` point, tutorials
+   - account data times, feature status, dance moves, the `character_homebind` point
    - known spells and action buttons from the character; factions, achievements, equipment sets, and talents are still empty
    - game speed, one `SMSG_UPDATE_OBJECT` that creates the player, and a time sync request
 6. `CMSG_REALM_SPLIT` gets a normal realm-split answer.

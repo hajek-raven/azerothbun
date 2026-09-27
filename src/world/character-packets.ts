@@ -39,12 +39,19 @@ export type ActionButton = { button: number; action: number; type: number };
 export type FactionSlot = { index: number; flags: number; standing: number };
 export type Homebind = { mapId: number; zoneId: number; x: number; y: number; z: number };
 
-export function initialSpellsBody(spellIds: readonly number[]): Uint8Array {
+export type InitialSpellCooldown = { spell: number; item: number; category: number; remaining: number };
+
+export function initialSpellsBody(spellIds: readonly number[], cooldowns: readonly InitialSpellCooldown[] = []): Uint8Array {
   const body = new ByteWriter().writeU8(0).writeU16(spellIds.length);
   for (const spellId of spellIds) {
     body.writeU32(spellId).writeU16(0);
   }
-  return body.writeU16(0).toUint8Array();
+  body.writeU16(cooldowns.length);
+  for (const row of cooldowns) {
+    body.writeU32(row.spell).writeU16(row.item).writeU16(row.category)
+      .writeU32(row.category ? 0 : row.remaining).writeU32(row.category ? row.remaining : 0);
+  }
+  return body.toUint8Array();
 }
 
 export function actionButtonsBody(actions: readonly ActionButton[]): Uint8Array {
@@ -97,26 +104,26 @@ export function charDeleteBody(code: number): Uint8Array {
   return new ByteWriter().writeU8(code).toUint8Array();
 }
 
-export function initialSpellsPacket(crypt: WorldCrypt | null, spellIds: readonly number[]): Uint8Array {
-  return encodeServerPacket(SMSG_INITIAL_SPELLS, initialSpellsBody(spellIds), crypt);
+export function initialSpellsPacket(crypt: WorldCrypt | null, spellIds: readonly number[], cooldowns: readonly InitialSpellCooldown[] = []): Uint8Array {
+  return encodeServerPacket(SMSG_INITIAL_SPELLS, initialSpellsBody(spellIds, cooldowns));
 }
 
 export function actionButtonsPacket(crypt: WorldCrypt | null, actions: readonly ActionButton[]): Uint8Array {
-  return encodeServerPacket(SMSG_ACTION_BUTTONS, actionButtonsBody(actions), crypt);
+  return encodeServerPacket(SMSG_ACTION_BUTTONS, actionButtonsBody(actions));
 }
 
 export function initializeFactionsPacket(crypt: WorldCrypt | null, slots: readonly FactionSlot[]): Uint8Array {
-  return encodeServerPacket(SMSG_INITIALIZE_FACTIONS, initializeFactionsBody(slots), crypt);
+  return encodeServerPacket(SMSG_INITIALIZE_FACTIONS, initializeFactionsBody(slots));
 }
 
 export function bindPointPacket(crypt: WorldCrypt | null, homebind: Homebind): Uint8Array {
-  return encodeServerPacket(SMSG_BINDPOINTUPDATE, bindPointBody(homebind), crypt);
+  return encodeServerPacket(SMSG_BINDPOINTUPDATE, bindPointBody(homebind));
 }
 
 export function charCreatePacket(crypt: WorldCrypt | null, code: number): Uint8Array {
-  return encodeServerPacket(SMSG_CHAR_CREATE, charCreateBody(code), crypt);
+  return encodeServerPacket(SMSG_CHAR_CREATE, charCreateBody(code));
 }
 
 export function charDeletePacket(crypt: WorldCrypt | null, code: number): Uint8Array {
-  return encodeServerPacket(SMSG_CHAR_DELETE, charDeleteBody(code), crypt);
+  return encodeServerPacket(SMSG_CHAR_DELETE, charDeleteBody(code));
 }

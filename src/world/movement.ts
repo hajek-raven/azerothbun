@@ -226,15 +226,26 @@ export function transportTooFar(info: MoveInfo, current: { x: number; y: number 
   return Math.hypot(dx, dy) > GRID_SIZE;
 }
 
-export function speedVerdict(opcode: number, speed: number): "ok" | "correct" | "kick" {
+/** The `UnitMoveType` a speed-change ack reports, or null. */
+export function speedMoveType(opcode: number): number | null {
+  const index = [...SPEED_LIMIT.keys()].indexOf(opcode);
+  return index < 0 ? null : index;
+}
+
+/**
+ * Compare an acknowledged speed with the one the server set: the base speed, or `expected` when auras changed it
+ * (`Unit::GetSpeed`).
+ */
+export function speedVerdict(opcode: number, speed: number, expected?: number): "ok" | "correct" | "kick" {
   const limit = SPEED_LIMIT.get(opcode);
   if (!limit || !Number.isFinite(speed)) {
     return "ok";
   }
-  if (speed > limit.limit + 0.01) {
+  const wanted = expected ?? limit.limit;
+  if (speed > wanted + 0.01) {
     return "kick";
   }
-  if (limit.limit - speed > 0.01) {
+  if (wanted - speed > 0.01) {
     return "correct";
   }
   return "ok";
@@ -288,16 +299,16 @@ export function nearTeleportPacket(crypt: WorldCrypt, guid: bigint, counter: num
     .writeF32(place.z)
     .writeF32(place.orientation)
     .writeU32(0);
-  return encodeServerPacket(0x0c7, body.toUint8Array(), crypt);
+  return encodeServerPacket(0x0c7, body.toUint8Array());
 }
 
 export function farTeleportPackets(crypt: WorldCrypt, map: number, place: { x: number; y: number; z: number; orientation: number }): Uint8Array[] {
   const pending = new ByteWriter().writeU32(map).toUint8Array();
   const world = new ByteWriter().writeU32(map).writeF32(place.x).writeF32(place.y).writeF32(place.z).writeF32(place.orientation).toUint8Array();
-  return [encodeServerPacket(0x03f, pending, crypt), encodeServerPacket(0x03e, world, crypt)];
+  return [encodeServerPacket(0x03f, pending), encodeServerPacket(0x03e, world)];
 }
 
-export function forceSpeedPacket(crypt: WorldCrypt, opcode: number, guid: bigint, counter: number): Uint8Array | null {
+export function forceSpeedPacket(crypt: WorldCrypt, opcode: number, guid: bigint, counter: number, speed?: number): Uint8Array | null {
   const limit = SPEED_LIMIT.get(opcode);
   if (!limit) {
     return null;
@@ -306,8 +317,14 @@ export function forceSpeedPacket(crypt: WorldCrypt, opcode: number, guid: bigint
   if (limit.run) {
     body.writeU8(0);
   }
-  body.writeF32(limit.limit);
-  return encodeServerPacket(limit.opcode, body.toUint8Array(), crypt);
+  body.writeF32(speed ?? limit.limit);
+  return encodeServerPacket(limit.opcode, body.toUint8Array());
+}
+
+/** `Unit::SetSpeed` for a player: `SMSG_FORCE_*_SPEED_CHANGE` for a `UnitMoveType`. */
+export function forceSpeedChangePacket(crypt: WorldCrypt, moveType: number, guid: bigint, counter: number, speed: number): Uint8Array | null {
+  const ack = [...SPEED_LIMIT.keys()][moveType];
+  return ack === undefined ? null : forceSpeedPacket(crypt, ack, guid, counter, speed);
 }
 
 export function sanitizeFlags(flags: number): number {

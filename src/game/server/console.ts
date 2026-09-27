@@ -1,11 +1,11 @@
-import type { Database } from "bun:sqlite";
+import type { Db } from "../../database/database.ts";
 import { stringToInt32 } from "../../common/config.ts";
 import { AccountOpResult, createAccount } from "../accounts/account-mgr.ts";
 import { timeStringToSecs } from "../time/timer.ts";
 import { ShutdownExitCode, type World } from "../world/world.ts";
 
 export type ConsoleContext = {
-  db: Database;
+  db: Db;
   world: World;
   expansion: number;
 };
@@ -15,7 +15,7 @@ export type ConsoleResult = {
   message: string;
 };
 
-export function handleConsoleCommand(line: string, context: ConsoleContext): ConsoleResult | null {
+export async function handleConsoleCommand(line: string, context: ConsoleContext): Promise<ConsoleResult | null> {
   const trimmed = line.trim();
   if (trimmed.length === 0) {
     return null;
@@ -63,14 +63,14 @@ function shutdownCommand(args: string[], world: World): ConsoleResult {
   return { ok: true, message: reason.length > 0 ? `Shutdown in ${delay} sec. ${reason}` : `Shutdown in ${delay} sec.` };
 }
 
-function accountCreateCommand(args: string[], context: ConsoleContext): ConsoleResult {
+async function accountCreateCommand(args: string[], context: ConsoleContext): Promise<ConsoleResult> {
   const accountName = args[0];
   const password = args[1];
   const email = args[2] ?? "";
   if (!accountName || !password) {
     return { ok: false, message: "account create <name> <password> [email]" };
   }
-  const result = createAccount(context.db, accountName, password, email, context.expansion);
+  const result = await createAccount(context.db, accountName, password, email, context.expansion);
   switch (result) {
     case AccountOpResult.Ok:
       return { ok: true, message: `Account created: ${accountName}` };

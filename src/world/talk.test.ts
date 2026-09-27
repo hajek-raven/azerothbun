@@ -1,4 +1,7 @@
-import { Database } from "bun:sqlite";
+import { testDatabase } from "../database/test-db.ts";
+import { character_queststatus_rewarded } from "../database/schema/characters.ts";
+import { worldFromSql } from "../database/test-world.ts";
+import { WorldTables } from "../database/world-tables.ts";
 import { expect, test } from "bun:test";
 import type { CharacterLoginKit } from "../characters/store.ts";
 import type { CreatureSpawn, CreatureTemplate, WorldData } from "../data/world.ts";
@@ -11,9 +14,10 @@ import { creditKillPackets, Talk, type TalkPacket } from "./talk.ts";
 
 const CREATURE_GUID = 1n | (197n << 24n) | (0xf130n << 48n);
 
-test("gossip hello lists the quest, accept stores it, and a kill opens the reward", () => {
-  const db = new Database(":memory:", { strict: true });
-  db.run(`
+test("gossip hello lists the quest, accept stores it, and a kill opens the reward", async () => {
+  const db = WorldTables.fromRows();
+  const chars = await testDatabase("characters");
+  worldFromSql(`
     CREATE TABLE gossip_menu (MenuID INTEGER, TextID INTEGER);
     CREATE TABLE gossip_menu_option (
       MenuID INTEGER, OptionID INTEGER, OptionIcon INTEGER, OptionText TEXT,
@@ -27,17 +31,15 @@ test("gossip hello lists the quest, accept stores it, and a kill opens the rewar
     );
     CREATE TABLE creature_queststarter (id INTEGER, quest INTEGER);
     CREATE TABLE creature_questender (id INTEGER, quest INTEGER);
-  `);
-  db.run("INSERT INTO gossip_menu VALUES (500, 1)");
-  db.run(
-    "INSERT INTO gossip_menu_option VALUES (500, 0, 0, 'Train me', 0, 1, 1, 0, 0, 0, 0, '', 0)",
-  );
-  db.run("INSERT INTO quest_template VALUES (783, 2, 1, 1, 0, 'A Threat Within', 6, 8, 25)");
-  db.run("INSERT INTO creature_queststarter VALUES (197, 783)");
-  db.run("INSERT INTO creature_questender VALUES (197, 783)");
+  `, db);
+  worldFromSql("INSERT INTO gossip_menu VALUES (500, 1)", db);
+  worldFromSql("INSERT INTO gossip_menu_option VALUES (500, 0, 0, 'Train me', 0, 1, 1, 0, 0, 0, 0, '', 0)", db);
+  worldFromSql("INSERT INTO quest_template VALUES (783, 2, 1, 1, 0, 'A Threat Within', 6, 8, 25)", db);
+  worldFromSql("INSERT INTO creature_queststarter VALUES (197, 783)", db);
+  worldFromSql("INSERT INTO creature_questender VALUES (197, 783)", db);
 
   const world = {
-    database: () => db,
+    tables: () => db,
     creatureSpawn: (guid: number) => (guid === 1 ? ({ guid: 1, entry: 197, npcFlags: 3, unitFlags: 0, dynamicFlags: 0 } as CreatureSpawn) : undefined),
     creatureTemplate: (entry: number) =>
       entry === 197
@@ -51,7 +53,7 @@ test("gossip hello lists the quest, accept stores it, and a kill opens the rewar
   const talk = new Talk(new GossipCatalog(db), new QuestCatalog(db), world);
   const player = { guid: 1, race: 1, class: 1, gender: 0, level: 1, xp: 0, money: 0, zone: 12, map: 0, position_x: 0, position_y: 0, position_z: 0 } as Character;
   const kit = { spells: [], actions: [], skills: [], factions: [], homebind: null } as CharacterLoginKit;
-  talk.login(db, player);
+  await talk.login(chars, player);
 
   const hello = talk.handle(0x17b, new ByteWriter().writeU64(CREATURE_GUID).toUint8Array(), player, kit, new Set());
   expect(hello?.[0]?.opcode).toBe(SMSG_GOSSIP_MESSAGE);
@@ -89,14 +91,15 @@ test("gossip hello lists the quest, accept stores it, and a kill opens the rewar
   expect(reward?.some((row) => row.opcode === SMSG_QUESTGIVER_QUEST_COMPLETE)).toBe(true);
   expect(player.money).toBe(25);
   expect(talk.quests.rewarded(783)).toBe(true);
-  talk.save(db, player.guid);
-  const stored = db.query<{ quest: number }, []>("SELECT quest FROM character_queststatus_rewarded").get();
+  await talk.save(chars, player.guid);
+  const [stored] = await chars.select({ quest: character_queststatus_rewarded.quest }).from(character_queststatus_rewarded);
   expect(stored?.quest).toBe(783);
 });
 
-test("quest log swap, party share, and party confirm", () => {
-  const db = new Database(":memory:", { strict: true });
-  db.run(`
+test("quest log swap, party share, and party confirm", async () => {
+  const db = WorldTables.fromRows();
+  const chars = await testDatabase("characters");
+  worldFromSql(`
     CREATE TABLE gossip_menu (MenuID INTEGER, TextID INTEGER);
     CREATE TABLE gossip_menu_option (
       MenuID INTEGER, OptionID INTEGER, OptionIcon INTEGER, OptionText TEXT,
@@ -110,15 +113,15 @@ test("quest log swap, party share, and party confirm", () => {
     );
     CREATE TABLE creature_queststarter (id INTEGER, quest INTEGER);
     CREATE TABLE creature_questender (id INTEGER, quest INTEGER);
-  `);
-  db.run("INSERT INTO quest_template VALUES (900, 2, 1, 1, 8, 'Sharable', 6, 1, 0)");
-  db.run("INSERT INTO quest_template VALUES (901, 2, 1, 1, 2, 'Party Accept', 6, 1, 0)");
-  db.run("INSERT INTO quest_template VALUES (902, 2, 1, 1, 0, 'Second', 7, 1, 0)");
-  db.run("INSERT INTO creature_queststarter VALUES (197, 900), (197, 901), (197, 902)");
-  db.run("INSERT INTO creature_questender VALUES (197, 900), (197, 901), (197, 902)");
+  `, db);
+  worldFromSql("INSERT INTO quest_template VALUES (900, 2, 1, 1, 8, 'Sharable', 6, 1, 0)", db);
+  worldFromSql("INSERT INTO quest_template VALUES (901, 2, 1, 1, 2, 'Party Accept', 6, 1, 0)", db);
+  worldFromSql("INSERT INTO quest_template VALUES (902, 2, 1, 1, 0, 'Second', 7, 1, 0)", db);
+  worldFromSql("INSERT INTO creature_queststarter VALUES (197, 900), (197, 901), (197, 902)", db);
+  worldFromSql("INSERT INTO creature_questender VALUES (197, 900), (197, 901), (197, 902)", db);
 
   const world = {
-    database: () => db,
+    tables: () => db,
     creatureSpawn: (guid: number) => (guid === 1 ? ({ guid: 1, entry: 197, npcFlags: 2, unitFlags: 0, dynamicFlags: 0 } as CreatureSpawn) : undefined),
     creatureTemplate: (entry: number) =>
       entry === 197
@@ -137,8 +140,8 @@ test("quest log swap, party share, and party confirm", () => {
   const leader = player(1);
   const member = player(2);
   const kit = { spells: [], actions: [], skills: [], factions: [], homebind: null } as CharacterLoginKit;
-  leaderTalk.login(db, leader);
-  memberTalk.login(db, member);
+  await leaderTalk.login(chars, leader);
+  await memberTalk.login(chars, member);
   const leaderInbox: TalkPacket[] = [];
   const memberInbox: TalkPacket[] = [];
   party.bind(peer(leaderTalk, leader, leaderInbox));

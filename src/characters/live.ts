@@ -1,4 +1,8 @@
-import type { Database } from "bun:sqlite";
+import { eq } from "drizzle-orm";
+import type { Db } from "../database/database.ts";
+import { realmcharacters } from "../database/schema/auth.ts";
+import { character_homebind, characters } from "../database/schema/characters.ts";
+import { objectGuids } from "../game/globals/object-guids.ts";
 import type { PlayerStart } from "../data/player-create.ts";
 import {
   CHAR_CREATE_ACCOUNT_LIMIT,
@@ -16,7 +20,7 @@ import {
   CHAR_NAME_TOO_LONG as NAME_TOO_LONG,
   CHAR_NAME_TOO_SHORT as NAME_TOO_SHORT,
   checkCharacterName,
-  ensureCharacterTables,
+  writeCharacterKit,
   type CharacterDraft,
   type CharacterKit,
 } from "./store.ts";
@@ -39,8 +43,8 @@ export function kitFromStart(start: PlayerStart): CharacterKit {
   };
 }
 
-export function characterCreateNameCode(db: Database, name: string): number | null {
-  const status = checkCharacterName(db, name);
+export async function characterCreateNameCode(db: Db, name: string): Promise<number | null> {
+  const status = await checkCharacterName(db, name);
   switch (status) {
     case CHAR_NAME_OK:
       return null;
@@ -57,102 +61,73 @@ export function characterCreateNameCode(db: Database, name: string): number | nu
   }
 }
 
-export function createPlayableCharacter(db: Database, draft: CharacterDraft, kit: CharacterKit): number {
-  ensureCharacterTables(db);
-  const nameCode = characterCreateNameCode(db, draft.name);
+/**
+ * `HandleCharCreateOpcode` → `Player::Create` + `SaveToDB(true)`: the `characters` row with the next player guid,
+ * the starting kit, and the account's `realmcharacters` count in the login database.
+ */
+export async function createPlayableCharacter(
+  characterDb: Db,
+  loginDb: Db,
+  draft: CharacterDraft,
+  kit: CharacterKit,
+  realmId = 1,
+): Promise<number> {
+  const nameCode = await characterCreateNameCode(characterDb, draft.name);
   if (nameCode !== null) {
     throw new Error(String(nameCode));
   }
-  const count = db
-    .query<{ count: number }, { account: number }>("SELECT COUNT(*) AS count FROM characters WHERE account = $account")
-    .get({ account: draft.accountId });
-  if ((count?.count ?? 0) >= MAX_CHARACTERS_PER_ACCOUNT) {
+  const count = await characterDb.$count(characters, eq(characters.account, draft.accountId));
+  if (count >= MAX_CHARACTERS_PER_ACCOUNT) {
     throw new Error(String(CHAR_CREATE_ACCOUNT_LIMIT));
   }
 
-  const insert = db.transaction(() => {
-    const result = db
-      .query(
-        `INSERT INTO characters (
-           account, name, race, class, gender, level, skin, face, hairStyle, hairColor, facialStyle,
-           position_x, position_y, position_z, map, zone, orientation, health, taximask, innTriggerId
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0)`,
-      )
-      .run(
-        draft.accountId,
-        draft.name,
-        draft.race,
-        draft.classId,
-        draft.gender,
-        draft.level,
-        draft.skin,
-        draft.face,
-        draft.hairStyle,
-        draft.hairColor,
-        draft.facialStyle,
-        draft.x,
-        draft.y,
-        draft.z,
-        draft.map,
-        draft.zone,
-        draft.orientation,
-        draft.health,
-      );
-    const guid = Number(result.lastInsertRowid);
-    writeKit(db, guid, kit);
-    refreshRealmCharacterCount(db, draft.accountId);
-    return guid;
+  const guid = objectGuids.player.generate();
+  await characterDb.transaction(async (tx) => {
+    await tx.insert(characters).values({
+      guid,
+      account: draft.accountId,
+      name: draft.name,
+      race: draft.race,
+      class: draft.classId,
+      gender: draft.gender,
+      level: draft.level,
+      skin: draft.skin,
+      face: draft.face,
+      hairStyle: draft.hairStyle,
+      hairColor: draft.hairColor,
+      facialStyle: draft.facialStyle,
+      position_x: draft.x,
+      position_y: draft.y,
+      position_z: draft.z,
+      map: draft.map,
+      zone: draft.zone,
+      orientation: draft.orientation,
+      health: draft.health,
+      taximask: "",
+      innTriggerId: 0,
+    });
+    await writeCharacterKit(tx, guid, kit);
   });
-  return insert();
+  await refreshRealmCharacterCount(characterDb, loginDb, draft.accountId, realmId);
+  return guid;
 }
 
-export function ensureStartingKit(db: Database, guid: number, kit: CharacterKit, health: number): boolean {
-  ensureCharacterTables(db);
-  const existing = db.query<{ guid: number }, [number]>("SELECT guid FROM character_homebind WHERE guid = ?").get(guid);
+export async function ensureStartingKit(db: Db, guid: number, kit: CharacterKit, health: number): Promise<boolean> {
+  const [existing] = await db.select({ guid: character_homebind.guid }).from(character_homebind).where(eq(character_homebind.guid, guid));
   if (existing) {
     return false;
   }
-  const fill = db.transaction(() => {
-    writeKit(db, guid, kit);
-    db.query("UPDATE characters SET health = ? WHERE guid = ?").run(health, guid);
+  await db.transaction(async (tx) => {
+    await writeCharacterKit(tx, guid, kit);
+    await tx.update(characters).set({ health }).where(eq(characters.guid, guid));
   });
-  fill();
   return true;
 }
 
-export function refreshRealmCharacterCount(db: Database, accountId: number): void {
-  db.query(
-    `INSERT INTO realmcharacters (realmid, acctid, numchars)
-     VALUES (1, ?, (SELECT COUNT(*) FROM characters WHERE account = ?))
-     ON CONFLICT(realmid, acctid) DO UPDATE SET numchars = excluded.numchars`,
-  ).run(accountId, accountId);
-}
-
-function writeKit(db: Database, guid: number, kit: CharacterKit): void {
-  const insertSpell = db.query("INSERT INTO character_spell (guid, spell, specMask) VALUES (?, ?, 1)");
-  for (const spell of kit.spells) {
-    insertSpell.run(guid, spell);
-  }
-  const insertAction = db.query("INSERT INTO character_action (guid, spec, button, action, type) VALUES (?, 0, ?, ?, ?)");
-  for (const action of kit.actions) {
-    insertAction.run(guid, action.button, action.action, action.type);
-  }
-  const insertSkill = db.query("INSERT INTO character_skills (guid, skill, value, max) VALUES (?, ?, ?, ?)");
-  for (const skill of kit.skills) {
-    insertSkill.run(guid, skill.skill, skill.value, skill.max);
-  }
-  const insertFaction = db.query("INSERT INTO character_reputation (guid, faction, standing, flags) VALUES (?, ?, ?, ?)");
-  for (const faction of kit.factions) {
-    insertFaction.run(guid, faction.faction, faction.standing, faction.flags);
-  }
-  db.query("INSERT INTO character_homebind (guid, mapId, zoneId, posX, posY, posZ) VALUES (?, ?, ?, ?, ?, ?)").run(
-    guid,
-    kit.homebind.mapId,
-    kit.homebind.zoneId,
-    kit.homebind.posX,
-    kit.homebind.posY,
-    kit.homebind.posZ,
-  );
+/** `CHAR_SEL_SUM_CHARS` then `LOGIN_REP_REALM_CHARACTERS`. */
+export async function refreshRealmCharacterCount(characterDb: Db, loginDb: Db, accountId: number, realmId = 1): Promise<void> {
+  const numchars = await characterDb.$count(characters, eq(characters.account, accountId));
+  await loginDb.insert(realmcharacters).values({ numchars, acctid: accountId, realmid: realmId }).onDuplicateKeyUpdate({ set: { numchars } });
 }
 
 function threeConsecutive(name: string): boolean {

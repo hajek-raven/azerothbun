@@ -1,6 +1,6 @@
-import type { Database } from "bun:sqlite";
 import type { Socket, TCPSocketListener } from "bun";
-import { log } from "../log.ts";
+import type { Db } from "../database/database.ts";
+import { log, logError } from "../log.ts";
 import { SocketBuffers } from "../net/socket-buffers.ts";
 import {
   AUTH_LOGON_CHALLENGE,
@@ -14,20 +14,22 @@ import { AuthSession, expectedPacketLength } from "./session.ts";
 export type AuthSocketData = {
   session: AuthSession;
   io: SocketBuffers;
+  /** Packets are handled one at a time; the next waits for the previous database round trip. */
+  pumping: Promise<void>;
 };
 
-export function startAuthServer(options: { hostname: string; port: number; db: Database }): TCPSocketListener<AuthSocketData> {
+export function startAuthServer(options: { hostname: string; port: number; db: Db }): TCPSocketListener<AuthSocketData> {
   return Bun.listen<AuthSocketData>({
     hostname: options.hostname,
     port: options.port,
     socket: {
       open(socket) {
-        socket.data = { session: new AuthSession(options.db), io: new SocketBuffers(socket) };
+        socket.data = { session: new AuthSession(options.db), io: new SocketBuffers(socket), pumping: Promise.resolve() };
         log("auth", `connection from ${socket.remoteAddress}`);
       },
       data(socket, data) {
         socket.data.io.receive(data);
-        pump(socket);
+        schedulePump(socket);
       },
       drain(socket) {
         socket.data.io.flush();
@@ -43,7 +45,16 @@ export function startAuthServer(options: { hostname: string; port: number; db: D
   });
 }
 
-function pump(socket: Socket<AuthSocketData>): void {
+function schedulePump(socket: Socket<AuthSocketData>): void {
+  socket.data.pumping = socket.data.pumping
+    .then(() => pump(socket))
+    .catch((error: unknown) => {
+      logError("auth", `session failed for ${socket.remoteAddress}`, error);
+      socket.data.io.close();
+    });
+}
+
+async function pump(socket: Socket<AuthSocketData>): Promise<void> {
   const { session, io } = socket.data;
   while (io.open && io.received.length > 0) {
     const length = expectedPacketLength(session.status, io.received);
@@ -62,7 +73,7 @@ function pump(socket: Socket<AuthSocketData>): void {
     }
 
     const packet = io.take(length);
-    const result = session.handle(packet);
+    const result = await session.handle(packet);
     const command = packet[0] ?? 0;
     const reply = result.packet ? ` -> ${authOpcodeName(result.packet[0] ?? 0)}` : "";
     log("auth", `C->S ${authOpcodeName(command)} ${packet.length}b${reply}${result.action === "close" ? " close" : ""}`);
