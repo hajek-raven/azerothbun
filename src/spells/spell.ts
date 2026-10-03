@@ -1,3 +1,4 @@
+import { CHEAT_CASTTIME, CHEAT_COOLDOWN, CHEAT_POWER } from "../game/Entities/Player/PlayerDefines.ts";
 import { irand, randNorm } from "../common/random.ts";
 import { ByteWriter } from "../net/byte-buffer.ts";
 import { packedGuid } from "../world/update-object.ts";
@@ -5,6 +6,7 @@ import { Aura, type AuraEffect } from "./aura.ts";
 import { isAuraTypeSupported } from "./aura-effects.ts";
 import * as D from "./defines.ts";
 import * as E from "./enums.ts";
+import { LINEOFSIGHT_ALL_CHECKS, ModelIgnoreFlags } from "../game/Grids/MapLike.ts";
 import {
   MSG_CHANNEL_START,
   MSG_CHANNEL_UPDATE,
@@ -304,6 +306,7 @@ export class Spell {
       }
     }
     this.castTime = this.hasTriggeredCastFlag(E.TRIGGERED_CAST_DIRECTLY) ? 0 : calcCastTime(this.info, this.castTimeSpeed());
+    if (caster.isPlayer && caster.getCommandStatus(CHEAT_CASTTIME)) this.castTime = 0;
     if ((isChanneled(this.info) || this.castTime) && caster.isPlayer && caster.isMoving() && this.info.interruptFlags & E.SPELL_INTERRUPT_FLAG_MOVEMENT && !this.isTriggered()) {
       if (this.castTime || !isActionAllowedChannel(this.info)) {
         this.sendCastResult(D.SPELL_FAILED_MOVING);
@@ -445,6 +448,7 @@ export class Spell {
       const target = this.unitTargetOf();
       if (target?.isCreature) caster.castSpell(target, 32747, { triggered: true });
     }
+    if (caster.isPlayer && caster.getCommandStatus(CHEAT_COOLDOWN)) caster.removeSpellCooldown(this.info.id, true);
     this.executedCurrently = false;
   }
 
@@ -1296,7 +1300,7 @@ export class Spell {
     this.uniqueTargets.push(info);
   }
 
-  /** `Spell::CheckEffectTarget` (charm limits; line of sight waits for vmaps). */
+  /** `Spell::CheckEffectTarget` (charm limits and the line of sight of an area target). */
   private checkEffectTarget(target: SpellUnit, effIndex: number): boolean {
     switch (this.info.effects[effIndex]!.applyAuraName) {
       case D.SPELL_AURA_MOD_POSSESS:
@@ -1310,6 +1314,32 @@ export class Spell {
       }
       default:
         break;
+    }
+
+    // xinef: skip los checking if spell has appropriate attribute, or target requires specific entry
+    // this is only for target addition and target has to have unselectable flag, this is valid for FLAG_EXTRA_TRIGGER and quest triggers however there are some without this flag, used not_selectable
+    const effectInfo = this.info.effects[effIndex]!;
+    if (
+      hasAttribute(this.info, 2, D.SPELL_ATTR2_IGNORE_LINE_OF_SIGHT) ||
+      (target.isCreature && (target.unitFlags & E.UNIT_FLAG_NOT_SELECTABLE) !== 0 && (IMPLICIT_TARGETS[effectInfo.targetA]?.checkType === E.TARGET_CHECK_ENTRY || IMPLICIT_TARGETS[effectInfo.targetB]?.checkType === E.TARGET_CHECK_ENTRY))
+    ) {
+      return true;
+    }
+
+    // if spell is triggered, need to check for LOS disable on the aura triggering it and inherit that behaviour
+    if (this.isTriggered() && this.triggeredByAura && hasAttribute(this.triggeredByAura.base.spellInfo, 2, D.SPELL_ATTR2_IGNORE_LINE_OF_SIGHT)) return true;
+
+    // Check targets for LOS visibility (except spells without range limitations)
+    const effect = this.info.effects[effIndex]!.effect;
+    // @ac-skip SPELL_EFFECT_RESURRECT_NEW / SKIN_PLAYER_CORPSE corpse targets, SPELL_EFFECT_SUMMON_RAF_FRIEND: corpses and recruit a friend are not ported
+    if (effect === D.SPELL_EFFECT_RESURRECT_NEW || effect === D.SPELL_EFFECT_SKIN_PLAYER_CORPSE || effect === D.SPELL_EFFECT_SUMMON_RAF_FRIEND) return true;
+
+    // normal case
+    if (target !== this.caster) {
+      if (this.hasDst()) {
+        const dest = this.targets.dest!;
+        if (!target.isWithinLOS(dest.x, dest.y, dest.z, ModelIgnoreFlags.M2, LINEOFSIGHT_ALL_CHECKS)) return false;
+      } else if (!this.caster.isWithinLOSInMap(target, ModelIgnoreFlags.M2, LINEOFSIGHT_ALL_CHECKS)) return false;
     }
     return true;
   }
@@ -1561,6 +1591,8 @@ export class Spell {
   private takePower(): void {
     const caster = this.caster;
     if (this.castItem || this.triggeredByAura) return;
+    // Don't take power if the spell is cast while .cheat power is enabled.
+    if (caster.isPlayer && caster.getCommandStatus(CHEAT_POWER)) return;
     const powerType = this.info.powerType;
     let hit = true;
     if (caster.isPlayer && (powerType === E.POWER_RAGE || powerType === E.POWER_ENERGY || powerType === E.POWER_RUNE || powerType === E.POWER_RUNIC_POWER) && this.targets.object) {
@@ -1619,6 +1651,7 @@ export class Spell {
   private triggerGlobalCooldown(): void {
     let gcd = this.info.startRecoveryTime;
     if (!gcd) return;
+    if (this.caster.isPlayer && this.caster.getCommandStatus(CHEAT_COOLDOWN)) return;
     if (this.info.startRecoveryTime >= 1000 && this.info.startRecoveryTime <= 1500) {
       if (this.info.startRecoveryCategory === 133 && this.info.startRecoveryTime === 1500 && this.info.dmgClass !== E.SPELL_DAMAGE_CLASS_MELEE && this.info.dmgClass !== E.SPELL_DAMAGE_CLASS_RANGED && !hasAttribute(this.info, 0, D.SPELL_ATTR0_USES_RANGED_SLOT) && !hasAttribute(this.info, 0, D.SPELL_ATTR0_IS_ABILITY)) {
         gcd = Math.trunc(gcd * this.caster.castSpeed);
@@ -1806,7 +1839,15 @@ export class Spell {
       if (target !== caster) {
         if (hasCustomAttribute(info, E.SPELL_ATTR0_CU_REQ_CASTER_BEHIND_TARGET) && target.hasInArc(Math.PI, caster)) return D.SPELL_FAILED_NOT_BEHIND;
         if (hasCustomAttribute(info, E.SPELL_ATTR0_CU_REQ_TARGET_FACING_CASTER) && !target.hasInArc(Math.PI, caster)) return D.SPELL_FAILED_NOT_INFRONT;
+
+        if (this.checksLineOfSight() && !caster.isWithinLOSInMap(target, ModelIgnoreFlags.M2, LINEOFSIGHT_ALL_CHECKS)) return D.SPELL_FAILED_LINE_OF_SIGHT;
       }
+    }
+
+    // Check for line of sight for spells with dest
+    if (this.hasDst() && this.checksLineOfSight(true)) {
+      const dest = this.targets.dest!;
+      if (!caster.isWithinLOS(dest.x, dest.y, dest.z, ModelIgnoreFlags.M2, LINEOFSIGHT_ALL_CHECKS)) return D.SPELL_FAILED_LINE_OF_SIGHT;
     }
     for (const effect of info.effects) {
       if (effect.targetA === D.TARGET_UNIT_PET) return this.triggeredByAura ? D.SPELL_FAILED_DONT_REPORT : D.SPELL_FAILED_NO_PET;
@@ -1862,6 +1903,17 @@ export class Spell {
       }
     }
     return D.SPELL_CAST_OK;
+  }
+
+  /**
+   * The condition of the line of sight checks of `Spell::CheckCast`: a positive spell of a totem, a spell with
+   * `SPELL_ATTR2_IGNORE_LINE_OF_SIGHT` (also set by a `disables` row), and an area spell with
+   * `SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT` need none. A destination ignores the redirect flag the unit target checks.
+   * @ac-skip `SPELL_FLAG_REDIRECTED` and spells cast by gameobjects (they ignore M2 models): no redirects, no gameobject casters.
+   */
+  private checksLineOfSight(_dest = false): boolean {
+    const info = this.info;
+    return (!this.caster.isTotem || !isPositive(info)) && !hasAttribute(info, 2, D.SPELL_ATTR2_IGNORE_LINE_OF_SIGHT) && !hasAttribute(info, 5, D.SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT);
   }
 
   /** `Spell::CheckItems` for reagents and the equipped weapon or armor requirement. */
@@ -1923,6 +1975,8 @@ export class Spell {
   private checkPower(): number {
     const caster = this.caster;
     if (this.castItem) return D.SPELL_CAST_OK;
+    // While .cheat power is enabled don't check if we need power to cast the spell.
+    if (caster.isPlayer && caster.getCommandStatus(CHEAT_POWER)) return D.SPELL_CAST_OK;
     if (this.info.powerType === E.POWER_HEALTH) return caster.health <= this.powerCost ? D.SPELL_FAILED_CASTER_AURASTATE : D.SPELL_CAST_OK;
     if (this.info.powerType >= E.MAX_POWERS) return D.SPELL_FAILED_UNKNOWN;
     // `CheckRuneCost`: only death knights pay runes, and the rune system is outside the baseline.

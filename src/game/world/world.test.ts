@@ -74,3 +74,15 @@ function emptyWorldConfig(): WorldConfig {
   settings.load();
   return settings;
 }
+
+test("the tick runs the sessions, then the map update, with the same diff", () => {
+  const world = new World(emptyWorldConfig());
+  const order: string[] = [];
+  world.setSessionUpdate((diff) => order.push(`sessions ${diff}`));
+  world.setMapUpdate((diff) => order.push(`maps ${diff}`));
+  world.update(37);
+  expect(order).toEqual(["sessions 37", "maps 37"]);
+  world.setMapUpdate(null);
+  world.update(1);
+  expect(order).toHaveLength(3);
+});

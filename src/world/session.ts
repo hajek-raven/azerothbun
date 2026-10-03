@@ -1,4 +1,31 @@
 import { inArray } from "drizzle-orm";
+import { queryFields, executeStatementAsync } from "../database/database.ts";
+import { LOGIN_SEL_ACCOUNT_INFO_BY_NAME, LOGIN_UPD_MUTE_TIME_LOGIN, LOGIN_UPD_SET_ACCOUNT_FLAG } from "../gen/LoginDatabase.gen.ts";
+import { RBACData } from "../game/Accounts/RBAC.ts";
+import { sAccountMgr } from "../game/Accounts/AccountMgr.ts";
+import { RBAC_PERM_RESTORE_SAVED_GM_STATE } from "../game/Accounts/RBACDefines.ts";
+import { ACCOUNT_FLAG_GM, LOCALE_enUS, SEC_GAMEMASTER, SEC_PLAYER, TOTAL_LOCALES } from "../shared/SharedDefines.ts";
+import { realm } from "../shared/Realms/Realm.ts";
+import { sObjectMgr } from "../game/Globals/ObjectMgr.ts";
+import { sGraveyard } from "../game/Misc/GameGraveyard.ts";
+import { SMSG_MOTD, sMotdMgr } from "../game/Motd/MotdMgr.ts";
+import { sFactionStore } from "../game/DataStores/DBCStores.ts";
+import { sCharacterCache } from "../game/Cache/CharacterCache.ts";
+import { ServerConfig } from "../game/world/world-config.ts";
+import { sWorld } from "../game/world/world.ts";
+import { CHAT_OPCODES, CMSG_CHAT_IGNORED, CMSG_EMOTE, CMSG_MESSAGECHAT, CMSG_TEXT_EMOTE, HandleChatIgnoredOpcode, HandleEmoteOpcode, HandleMessagechatOpcode, HandleTextEmoteOpcode } from "../game/Handlers/ChatHandler.ts";
+import { PlayerCommandState, SessionPlayer } from "./session-player.ts";
+import { OBJECT_FIELD_SCALE_X, PLAYER_EXPLORED_ZONES_1, PLAYER__FIELD_KNOWN_TITLES, PLAYER_CHOSEN_TITLE, PLAYER_FIELD_ARENA_CURRENCY, PLAYER_FIELD_HONOR_CURRENCY, PLAYER_FIELD_KILLS, PLAYER_FIELD_LIFETIME_HONORABLE_KILLS, PLAYER_FIELD_TODAY_CONTRIBUTION, PLAYER_FIELD_YESTERDAY_CONTRIBUTION, PLAYER_FLAGS as PLAYER_FLAGS_FIELD, UNIT_FIELD_COMBATREACH, UNIT_FIELD_DISPLAYID, UNIT_FIELD_FACTIONTEMPLATE, UNIT_FIELD_MOUNTDISPLAYID, UNIT_FIELD_NATIVEDISPLAYID } from "../gen/UpdateFields.gen.ts";
+import { DeleteFromDB } from "../game/Entities/Player/PlayerMisc.ts";
+import { LoadCharacterSettings, SavePlayerSettings } from "../game/Entities/Player/PlayerSettings.ts";
+import { AT_LOGIN_RESURRECT, CHEAT_GOD, PLAYER_EXTRA_ACCEPT_WHISPERS, PLAYER_EXTRA_GM_CHAT, PLAYER_EXTRA_GM_INVISIBLE, PLAYER_EXTRA_GM_ON, PLAYER_FLAGS_IS_OUT_OF_BOUNDS } from "../game/Entities/Player/PlayerDefines.ts";
+import { PlayerAreaUpdates } from "../game/Entities/Player/PlayerUpdates.ts";
+import { MAP_THE_OCULUS } from "../game/Maps/AreaDefines.ts";
+import { createAreaHost, isBelowMap, terrainStatusOf } from "./session-terrain.ts";
+import { buildItemPushResult, getItemPos } from "../items/bags.ts";
+import { bagSlotOf } from "./loot-play.ts";
+import type { ItemInstance } from "../items/instance.ts";
+import type { InventoryItem } from "../items/bags.ts";
 import { logError } from "../log.ts";
 import type { Db } from "../database/database.ts";
 import { item_instance } from "../database/schema/characters.ts";
@@ -62,11 +89,11 @@ import { saveCharacterState } from "../characters/persist.ts";
 import { AccountTutorials, loadTutorials, saveTutorials } from "../characters/tutorials.ts";
 import { applyOfflineRest, isResting, logoutRestSnapshot } from "../characters/rest.ts";
 import { characterStartFromDbc } from "../characters/dbc-start.ts";
-import { deleteCharacter, loadCharacterKit, type CharacterLoginKit } from "../characters/store.ts";
+import { loadCharacterKit, type CharacterLoginKit } from "../characters/store.ts";
 import { CLIENT_BUILD, findAccount, findCharacter, findCharacterById, listCharacters, type Character } from "../db.ts";
 import { hexOpcode, log } from "../log.ts";
 import { ByteReader, ByteWriter } from "../net/byte-buffer.ts";
-import { fallDamage, farTeleportPackets, forceSpeedChangePacket, forceSpeedPacket, movementKind, speedMoveType, movingOrTurning, nearTeleportPacket, readMoveInfo, shouldResetFall, speedVerdict, transportTooFar, writeMoveInfo } from "./movement.ts";
+import { fallDamage, farTeleportPackets, forceSpeedChangePacket, forceSpeedPacket, movementFlagsAllowed, movementKind, speedMoveType, movingOrTurning, nearTeleportPacket, readMoveInfo, shouldResetFall, speedVerdict, transportTooFar, writeMoveInfo } from "./movement.ts";
 import { hearthTeleport, parseActivateTaxi, parseActivateTaxiExpress, spellTeleport, taxiTeleport } from "./teleport-start.ts";
 import {
   CMSG_DELETEEQUIPMENT_SET,
@@ -78,7 +105,7 @@ import {
   parseEquipmentSetSave,
   saveSet,
 } from "../items/equipment-sets.ts";
-import { destroyItem, type Inventory } from "../items/bags.ts";
+import { CMSG_DESTROYITEM, CMSG_SWAP_INV_ITEM, destroyItem, type Inventory } from "../items/bags.ts";
 import { itemGuidRaw } from "../items/equipment-sets.ts";
 import { spellRecoveryFromRecord, type SpellRecovery } from "../items/use-item.ts";
 import { isChanneled, isPassive, isPositive, hasAttribute, type SpellStore } from "../spells/spell-info.ts";
@@ -103,7 +130,7 @@ import { handleLoot, LOOT_OPCODES, lootItemProto, storeLootItem, type LootPlayCt
 import { createUseCooldowns, handleUseItem, USE_ITEM_OPCODES, type ItemCast, type UseCooldowns } from "./use-item-play.ts";
 import { createVendorSession, handleVendor, VENDOR_OPCODES, type VendorSession } from "./vendor-play.ts";
 import { QuestParty } from "./party.ts";
-import { PlayerView, type OnlinePlayer } from "./players.ts";
+import { PlayerView } from "./players.ts";
 import {
   CHAR_CREATE_ACCOUNT_LIMIT,
   CHAR_CREATE_FAILED,
@@ -114,9 +141,13 @@ import {
   charDeletePacket,
   type FactionSlot,
 } from "./character-packets.ts";
-import { fieldUpdateBlock, healthUpdateBlock, packedGuid as packedGuidOf, standStateUpdateBlock, type PlayerFieldStats } from "./update-object.ts";
+import { fieldUpdateBlock, healthUpdateBlock, packedGuid as packedGuidOf, raceAppearance, standStateUpdateBlock, type PlayerFieldStats } from "./update-object.ts";
 import { CMSG_PLAYER_LOGIN, worldOpcodeName } from "./opcodes.ts";
-import { creatureQueryPayload, diffVisible, gameObjectQueryPayload, indexSpawns, itemQueryPayload, spawnUpdatePayloads, type SpawnIndex } from "./spawn.ts";
+import { creatureQueryPayload, gameObjectQueryPayload, itemQueryPayload } from "./spawn.ts";
+import { mapCreatureLocator, type CreatureLocator } from "./map-world.ts";
+import { SessionMapPlayer } from "./session-map-player.ts";
+import type { MovementOwner } from "../game/Movement/MovementOwner.ts";
+import { addToMap, relocateOnMap, removeFromMap, showWorld } from "./session-map.ts";
 import { creditKillPackets, fullQuestLog, Talk, talkDataFor } from "./talk.ts";
 import { combatWorldFor, highGuidIsCreature, type CombatPlayer, type CombatWorld, type CreatureKill, type PlayerMelee } from "../combat/combat-world.ts";
 import { CMSG_SET_SELECTION, CMSG_SETSHEATHED, POWER_RAGE, UNIT_FLAG_IN_COMBAT } from "../combat/constants.ts";
@@ -132,6 +163,7 @@ import { SPELL_AURA_FEIGN_DEATH, SPELL_AURA_MOD_INVISIBILITY, SPELL_AURA_MOD_STE
 import { UNIT_FLAG_LOOTING } from "../spells/enums.ts";
 import {
   AUTH_FAILED,
+  AUTH_BANNED,
   AUTH_OK,
   addonInfoPacket,
   accountDataTimesPacket,
@@ -195,85 +227,118 @@ export type SessionDatabases = { login: Db; characters: Db };
 const HEARTBEAT = 0x0ee;
 const TIME_SYNC_INTERVAL_MS = 10_000;
 
+const INVENTORY_SLOT_BAG_0 = 255;
+
 export class WorldSession {
   crypt: WorldCrypt | null = null;
-  private readonly seed = crypto.getRandomValues(new Uint8Array(4));
-  private accountId = 0;
+  readonly seed = crypto.getRandomValues(new Uint8Array(4));
+  accountId = 0;
+  /** `WorldSession::_accountName` */
+  accountName = "";
+  /** `WorldSession::_security` (`account_access.gmlevel` for this realm). */
+  security = SEC_PLAYER;
+  /** `WorldSession::_RBACData` */
+  rbacData: RBACData | null = null;
+  /** `WorldSession::m_muteTime` */
+  muteTime = 0;
+  /** `WorldSession::m_sessionDbcLocale` / `m_sessionDbLocaleIndex` */
+  locale = LOCALE_enUS;
+  /** `WorldSession::_accountFlags` */
+  accountFlags = 0;
+  /** `WorldSession::m_expansion` */
+  expansion = 2;
+  /** `WorldSession::m_latency` */
+  latency = 0;
+  /** `WorldSession::_player` as the command code sees it. */
+  playerFacade: SessionPlayer | null = null;
+  /** `Player` state kept outside the character row (cheats, recall, whisper white list, AFK text). */
+  commandState = new PlayerCommandState();
+  /** Closes the socket (`KickPlayer`). */
+  closeSocket: (() => void) | null = null;
+  /** `WorldSession::_packetLogging` */
+  packetLogging = false;
+  /** `WorldSession::GetRemoteAddress` */
+  remoteAddress = "";
   /** `WorldSession::m_Tutorials`, loaded at `CMSG_AUTH_SESSION` and saved with the character. */
-  private tutorials = new AccountTutorials();
-  private character: Character | null = null;
-  private kit: CharacterLoginKit | null = null;
-  private timeSyncCounter = 0;
-  private pendingTimeSync: number | null = 0;
-  private lastTimeSync = Date.now();
-  private orderCounter = 1;
-  private clientMoveTime = 0;
-  private fallbackHealth = 60;
-  private standState = -1;
+  tutorials = new AccountTutorials();
+  character: Character | null = null;
+  kit: CharacterLoginKit | null = null;
+  timeSyncCounter = 0;
+  pendingTimeSync: number | null = 0;
+  lastTimeSync = Date.now();
+  orderCounter = 1;
+  clientMoveTime = 0;
+  fallbackHealth = 60;
+  standState = -1;
   /** The player's unit/player update fields and stat modifiers (`Player` stat system). */
   stats: PlayerStats | null = null;
   skills: PlayerSkills | null = null;
-  private regen: PlayerRegen | null = null;
+  regen: PlayerRegen | null = null;
   /** `UNIT_FIELD_BYTES_0` display power from `ChrClasses.DisplayPower`. */
-  private powerType = 0;
-  private readonly env: PlayerEnvironment;
-  private lastFallZ = 0;
-  private lastFallTime = 0;
-  private clockDelta = 0;
-  private syncSentAt = 0;
-  private pendingTeleport: { map: number; x: number; y: number; z: number; orientation: number; far: boolean } | null = null;
-  private logoutTimer: ReturnType<typeof setTimeout> | null = null;
-  private inCombat = false;
-  private falling = false;
-  private deathState: DeathState = "alive";
-  private graveyards: GraveyardStore | null = null;
-  private resurrectRequest: ResurrectRequestData | null = null;
-  private readonly knownSpawns = new Set<bigint>();
-  private inventory: Inventory | null = null;
-  private useCooldowns: UseCooldowns = createUseCooldowns();
-  private savedSpellCooldowns: SavedSpellCooldown[] = [];
-  private savedAuras: SavedAura[] = [];
+  powerType = 0;
+  readonly env: PlayerEnvironment;
+  lastFallZ = 0;
+  lastFallTime = 0;
+  clockDelta = 0;
+  syncSentAt = 0;
+  pendingTeleport: { map: number; x: number; y: number; z: number; orientation: number; far: boolean } | null = null;
+  logoutTimer: ReturnType<typeof setTimeout> | null = null;
+  inCombat = false;
+  falling = false;
+  deathState: DeathState = "alive";
+  graveyards: GraveyardStore | null = null;
+  resurrectRequest: ResurrectRequestData | null = null;
+  /** The player on its map (the grid object the visibility notifiers work with); null while on no map. */
+  mapPlayer: SessionMapPlayer | null = null;
+  /** The zone and area state of the player (`m_zoneUpdateId`, the exploration check, the rest flags); null out of world. */
+  area: PlayerAreaUpdates | null = null;
+  /** Packets a map or area update queued while a handler runs (they go into its result, in order). */
+  private captured: Uint8Array[] | null = null;
+  inventory: Inventory | null = null;
+  useCooldowns: UseCooldowns = createUseCooldowns();
+  savedSpellCooldowns: SavedSpellCooldown[] = [];
+  savedAuras: SavedAura[] = [];
   /** The player's `Unit` for spells and auras (null without a spell store or before the stats load). */
   unit: PlayerSpellUnit | null = null;
   /** Spell packets produced while no socket is attached (returned from the handler instead). */
-  private spellOutbox: Uint8Array[] = [];
+  spellOutbox: Uint8Array[] = [];
   /** `Player::GetSelection` */
-  private selection = 0n;
+  selection = 0n;
   /** The spell map when there is no combat world (no spawns loaded): only this player. */
-  private soloMap: SpellMap | null = null;
-  private vendorSession: VendorSession = createVendorSession();
+  soloMap: SpellMap | null = null;
+  vendorSession: VendorSession = createVendorSession();
   /** `Player::m_lootGuid`: the corpse whose loot window is open. */
-  private lootGuid = 0n;
-  private readonly spellRecovery: ReadonlyMap<number, SpellRecovery>;
-  private readonly spawns: SpawnIndex | null;
-  private seen: OnlinePlayer | null = null;
-  private deliver: ((packet: Uint8Array) => void) | null = null;
-  private readonly talk: Talk | null;
+  lootGuid = 0n;
+  readonly spellRecovery: ReadonlyMap<number, SpellRecovery>;
+  /** The creatures of the loaded grids, for the combat code. */
+  readonly spawns: CreatureLocator | null;
+  deliver: ((packet: Uint8Array) => void) | null = null;
+  readonly talk: Talk | null;
   /** Creature combat shared by every session on this spawn index (`Map` units, threat, and swing timers). */
-  private readonly combat: CombatWorld | null;
+  readonly combat: CombatWorld | null;
   /** Last `MovementInfo.flags` from the client, for the melee leeway range. */
-  private moveFlags = 0;
+  moveFlags = 0;
   readonly greeting: Uint8Array;
 
   /** `Player::SaveToDB` runs queued; the next save and the next packet wait for the previous one. */
-  private pendingSave: Promise<void> = Promise.resolve();
+  pendingSave: Promise<void> = Promise.resolve();
   /** `item_instance.durability` of the carried items, for `Item::IsBroken` in the stat system. */
-  private readonly itemDurability = new Map<number, number>();
+  readonly itemDurability = new Map<number, number>();
 
   constructor(
-    private readonly db: SessionDatabases,
-    private readonly world: WorldData | null = null,
-    spawns: SpawnIndex | null = null,
-    private readonly players: PlayerView = new PlayerView(),
-    private readonly dbc: DbcStores | null = null,
-    private readonly party: QuestParty = new QuestParty(),
+    readonly db: SessionDatabases,
+    readonly world: WorldData | null = null,
+    spawns: CreatureLocator | null = null,
+    readonly players: PlayerView = new PlayerView(),
+    readonly dbc: DbcStores | null = null,
+    readonly party: QuestParty = new QuestParty(),
     spellRecovery?: ReadonlyMap<number, SpellRecovery>,
     env?: PlayerEnvironment,
-    private readonly spellStore: SpellStore | null = null,
-    private readonly itemDbc: ItemDbc = ItemDbc.empty(),
+    readonly spellStore: SpellStore | null = null,
+    readonly itemDbc: ItemDbc = ItemDbc.empty(),
   ) {
     this.env = env ?? defaultPlayerEnvironment();
-    this.spawns = spawns ?? (world ? indexSpawns(world) : null);
+    this.spawns = spawns ?? (world ? mapCreatureLocator : null);
     this.talk = world ? new Talk(talkDataFor(world).gossip, talkDataFor(world).quests, world, this.party) : null;
     this.spellRecovery = spellRecovery ?? spellRecoveryFromStores(dbc);
     this.combat = world && this.spawns ? combatWorldFor(world, this.spawns, worldDatabase(world), dbc) : null;
@@ -304,11 +369,11 @@ export class WorldSession {
   }
 
   /** `UNIT_FIELD_HEALTH`. Writes clamp to max health and reach the client with the next field flush. */
-  private get health(): number {
+  get health(): number {
     return this.stats ? this.stats.health : this.fallbackHealth;
   }
 
-  private set health(value: number) {
+  set health(value: number) {
     if (this.stats) {
       this.stats.setHealth(value);
     } else {
@@ -316,7 +381,7 @@ export class WorldSession {
     }
   }
 
-  private get maxHealth(): number {
+  get maxHealth(): number {
     return this.stats ? this.stats.maxHealth : 60;
   }
 
@@ -332,10 +397,11 @@ export class WorldSession {
     // `Unit::Update`: spell events, current spells, and auras.
     this.unit?.updateSpellsAndAuras(diff);
     this.updateCombat(diff);
+    this.area?.update(diff);
     this.flushFields();
   }
 
-  private updateRegen(diff: number): void {
+  updateRegen(diff: number): void {
     const stats = this.stats;
     const regen = this.regen;
     const character = this.character;
@@ -355,7 +421,7 @@ export class WorldSession {
   }
 
   /** Values updates for the fields `PlayerStats` and `PlayerSkills` changed since the last flush. */
-  private fieldUpdates(): { self: Uint8Array | null; others: Uint8Array | null } {
+  fieldUpdates(): { self: Uint8Array | null; others: Uint8Array | null } {
     const character = this.character;
     if (!character) {
       return { self: null, others: null };
@@ -383,7 +449,7 @@ export class WorldSession {
   }
 
   /** Sends the pending field changes now (tick path). */
-  private flushFields(): void {
+  flushFields(): void {
     const character = this.character;
     if (!character || !this.crypt) {
       return;
@@ -398,7 +464,7 @@ export class WorldSession {
   }
 
   /** What other players' create block carries for this player: the PUBLIC unit fields only. */
-  private publicFieldStats(): PlayerFieldStats | undefined {
+  publicFieldStats(): PlayerFieldStats | undefined {
     const stats = this.stats;
     const character = this.character;
     if (!stats || !character) {
@@ -425,11 +491,12 @@ export class WorldSession {
     const packets = giveXp(ctx, amount, victim);
     if (this.character && this.character.level !== before) {
       this.talk?.syncSpeaker(this.character);
+      sCharacterCache.updateCharacterLevel(this.character.guid, this.character.level);
     }
     return packets;
   }
 
-  private progressContext(): ProgressContext | null {
+  progressContext(): ProgressContext | null {
     const character = this.character;
     const stats = this.stats;
     const worldDb = worldDatabase(this.world);
@@ -493,7 +560,10 @@ export class WorldSession {
     return result;
   }
 
-  private async handleOpcode(opcode: number, payload: Uint8Array): Promise<WorldResult> {
+  async handleOpcode(opcode: number, payload: Uint8Array): Promise<WorldResult> {
+    if (CHAT_OPCODES.has(opcode)) {
+      return this.handleChat(opcode, payload);
+    }
     const talked = this.handleTalk(opcode, payload);
     if (talked) {
       return talked;
@@ -588,7 +658,7 @@ export class WorldSession {
     }
   }
 
-  private async handleCharEnum(): Promise<WorldResult> {
+  async handleCharEnum(): Promise<WorldResult> {
     if (!this.crypt) {
       return { packets: [], sent: [], close: true };
     }
@@ -600,11 +670,18 @@ export class WorldSession {
         gearByGuid.set(character.guid, await loadCharEnumGear(this.db.characters, worldDb, character.guid));
       }
     }
+    // `CHAR_SEL_ENUM` joins the active `character_banned` rows (`CHARACTER_FLAG_LOCKED_BY_BILLING`).
+    const banned = new Set<number>();
+    for (const character of characters) {
+      const [row] = await queryFields(this.db.characters, "SELECT guid FROM character_banned WHERE guid = ? AND active = 1", character.guid);
+      if (row) banned.add(character.guid);
+    }
     log("world", `sending SMSG_CHAR_ENUM with ${characters.length} character(s)`);
-    return { packets: [charEnumPacket(this.crypt, characters, gearByGuid)], sent: ["SMSG_CHAR_ENUM"], close: false };
+    const declinedNames = sWorld().getBoolConfig(ServerConfig.CONFIG_DECLINED_NAMES_USED);
+    return { packets: [charEnumPacket(this.crypt, characters, gearByGuid, banned, declinedNames)], sent: ["SMSG_CHAR_ENUM"], close: false };
   }
 
-  private async handleAuthSession(payload: Uint8Array): Promise<WorldResult> {
+  async handleAuthSession(payload: Uint8Array): Promise<WorldResult> {
     if (this.crypt) {
       log("world", "duplicate CMSG_AUTH_SESSION, closing");
       return { packets: [], sent: [], close: true };
@@ -628,7 +705,15 @@ export class WorldSession {
       log("world", `bad session digest for ${packet.account}, closing`);
       return { packets: [authResponsePacket(this.crypt, AUTH_FAILED)], sent: ["SMSG_AUTH_RESPONSE"], close: true };
     }
+    const info = await this.loadAccountInfo(packet.account);
+    if (info.banned) {
+      log("world", "WorldSocket::HandleAuthSession: Sent Auth Response (Account banned).");
+      return { packets: [authResponsePacket(this.crypt, AUTH_BANNED)], sent: ["SMSG_AUTH_RESPONSE"], close: true };
+    }
     this.accountId = account.id;
+    this.accountName = packet.account;
+    await this.loadPermissions();
+    this.validateAccountFlags();
     log("world", `${packet.account} authenticated, account id ${account.id}`);
     const packets = [authResponsePacket(this.crypt, AUTH_OK)];
     const sent = ["SMSG_AUTH_RESPONSE"];
@@ -645,7 +730,7 @@ export class WorldSession {
     return { packets, sent, close: false };
   }
 
-  private async handlePlayerLogin(payload: Uint8Array): Promise<WorldResult> {
+  async handlePlayerLogin(payload: Uint8Array): Promise<WorldResult> {
     if (!this.crypt || payload.length < 8) {
       return { packets: [], sent: [], close: true };
     }
@@ -657,6 +742,15 @@ export class WorldSession {
     }
     const playing = { ...character };
     this.applyOfflineRestOnLogin(playing);
+    // `Player::LoadCorpse`: a character revived offline (`Player::OfflineResurrect`) comes back at half health.
+    if (playing.at_login & AT_LOGIN_RESURRECT) {
+      playing.at_login &= ~AT_LOGIN_RESURRECT;
+      if ((playing.playerFlags & PLAYER_FLAGS_GHOST) !== 0 || playing.health <= 0) {
+        playing.playerFlags &= ~PLAYER_FLAGS_GHOST;
+        const maxHealth = this.world?.playerStart(playing.race, playing.class, playing.level)?.stats.health ?? 2;
+        playing.health = Math.max(1, Math.floor(maxHealth * 0.5));
+      }
+    }
     this.deathState = (playing.playerFlags & PLAYER_FLAGS_GHOST) !== 0 ? "dead" : playing.health <= 0 ? "corpse" : "alive";
     this.character = playing;
     this.timeSyncCounter = 0;
@@ -670,7 +764,6 @@ export class WorldSession {
     this.lastFallTime = 0;
     this.clockDelta = 0;
     this.pendingTeleport = null;
-    this.knownSpawns.clear();
     log("world", `${playing.name} entering map ${playing.map}`);
     await this.talk?.login(this.db.characters, playing);
     const worldDb = worldDatabase(this.world);
@@ -680,7 +773,31 @@ export class WorldSession {
     this.vendorSession = createVendorSession();
     this.lootGuid = 0n;
     await this.loadPlayerUnit(playing, login);
-    const entered = this.withSpawns(loginPackets(this.crypt, playing, login), [...LOGIN_PACKET_NAMES]);
+    this.commandState = new PlayerCommandState();
+    this.commandState.charSettingsMap = await LoadCharacterSettings(this.db.characters, playing.guid);
+    this.playerFacade = new SessionPlayer(this);
+    this.area = new PlayerAreaUpdates(createAreaHost(this));
+    this.initCommandFields(playing);
+    this.restoreGmState(playing);
+    if (this.stats && login.stats) {
+      // The login create block carries the fields the GM state and `InitDisplayIds` just set.
+      const fresh = this.stats.fieldEntries();
+      const freshIndexes = new Set(fresh.map((field) => field.index));
+      login.stats.fields = [...(login.stats.fields ?? []).filter((field) => !freshIndexes.has(field.index)), ...fresh];
+      this.stats.takeChanged();
+    }
+    const burst = loginPackets(this.crypt, playing, login);
+    const names = [...LOGIN_PACKET_NAMES];
+    // `HandlePlayerLoginFromDB`: Send MOTD, after SMSG_FEATURE_SYSTEM_STATUS.
+    const motdAt = names.indexOf("SMSG_FEATURE_SYSTEM_STATUS") + 1;
+    burst.splice(motdAt, 0, encodeServerPacket(SMSG_MOTD, sMotdMgr.GetMotdPacket(this.getSessionDbLocaleIndex())));
+    names.splice(motdAt, 0, "SMSG_MOTD");
+    // `Map::AddPlayerToMap`: the player is on the map and sees what is near (`SendInitialPacketsAfterAddToMap`)
+    this.registerOnline(playing);
+    addToMap(this);
+    const entered = this.withVisible(burst, names);
+    // `Player::SendInitialPacketsAfterAddToMap`: update zone (the world states, the area flags)
+    this.appendCaptured(entered, () => this.area?.updateZoneAfterAddToMap());
     for (const extra of this.talk?.loginUpdate(playing) ?? []) {
       entered.packets.push(encodeServerPacket(extra.opcode, extra.body));
       entered.sent.push(extra.name);
@@ -704,7 +821,7 @@ export class WorldSession {
    * The stat and skill part of `Player::LoadFromDB`: `_LoadSkills`, `InitStatsForLevel`, `LearnDefaultSkills`,
    * the equipped items' `_ApplyItemMods`, `UpdateAllStats`, then the saved health and power clamped to the new max.
    */
-  private async loadPlayerUnit(character: Character, login: LoginCharacterState): Promise<void> {
+  async loadPlayerUnit(character: Character, login: LoginCharacterState): Promise<void> {
     this.stats = null;
     this.skills = null;
     this.regen = null;
@@ -791,7 +908,7 @@ export class WorldSession {
   }
 
   /** Equipment slots 0-18 of the backpack bag, with their `item_template` rows and broken state. */
-  private equippedStatItems(): Map<number, EquippedStatItem> {
+  equippedStatItems(): Map<number, EquippedStatItem> {
     const out = new Map<number, EquippedStatItem>();
     const worldDb = worldDatabase(this.world);
     const equipment = this.inventory?.slots.get(0);
@@ -816,7 +933,7 @@ export class WorldSession {
   }
 
   /** `Item::IsBroken` from the saved `item_instance.durability`. */
-  private itemBroken(itemGuid: number, maxDurability: number): boolean {
+  itemBroken(itemGuid: number, maxDurability: number): boolean {
     if (maxDurability <= 0) {
       return false;
     }
@@ -824,7 +941,7 @@ export class WorldSession {
   }
 
   /** Reloads `item_instance.durability` for everything in the inventory. */
-  private async refreshItemDurability(): Promise<void> {
+  async refreshItemDurability(): Promise<void> {
     this.itemDurability.clear();
     const guids = this.inventory ? [...this.inventory.byGuid.keys()] : [];
     if (guids.length === 0) {
@@ -843,7 +960,7 @@ export class WorldSession {
    * After a bag, equip, vendor, or loot packet: equipment slots whose item or broken state changed go through
    * `_ApplyItemMods` (remove, then apply), like `EquipItem` / `RemoveItem` / `DurabilityPointsLoss`.
    */
-  private syncEquipmentStats(): void {
+  syncEquipmentStats(): void {
     const stats = this.stats;
     if (!stats) {
       return;
@@ -870,7 +987,7 @@ export class WorldSession {
     }
   }
 
-  private async prepareLogin(character: Character): Promise<LoginCharacterState> {
+  async prepareLogin(character: Character): Promise<LoginCharacterState> {
     const start = this.world?.playerStart(character.race, character.class, character.level) ?? null;
     let kit = await loadCharacterKit(this.db.characters, character.guid);
     const fresh = Boolean(start && !kit.homebind);
@@ -962,7 +1079,7 @@ export class WorldSession {
     };
   }
 
-  private applyDbc(
+  applyDbc(
     kit: CharacterLoginKit,
     race: number,
     classId: number,
@@ -999,8 +1116,10 @@ export class WorldSession {
    * `Player::SaveToDB`: the row, kit, quests, auras, cooldowns, and inventory as they are now, queued behind the
    * previous save. Callers in the world tick do not wait; `handle` waits before it answers the packet.
    */
-  private saveLoggedInCharacter(character: Character): void {
+  saveLoggedInCharacter(character: Character): void {
     const current = this.character?.guid === character.guid;
+    // Player::_SavePlayerSettings
+    if (current && this.commandState) SavePlayerSettings(this.db.characters, character.guid, this.commandState.charSettingsMap);
     const kit = this.kit ? { ...this.kit, skills: [...this.kit.skills] } : null;
     if (current && kit) {
       this.syncUnitToCharacter(character, kit);
@@ -1029,7 +1148,7 @@ export class WorldSession {
   }
 
   /** `_SaveToDB` reads health, `power1..7`, and the skill rows off the live unit. */
-  private syncUnitToCharacter(character: Character, kit: CharacterLoginKit): void {
+  syncUnitToCharacter(character: Character, kit: CharacterLoginKit): void {
     const stats = this.stats;
     if (stats) {
       character.health = stats.health;
@@ -1046,7 +1165,7 @@ export class WorldSession {
     }
   }
 
-  private appendPlay(
+  appendPlay(
     entered: { packets: Uint8Array[]; sent: string[] },
     rows: { opcode: number; name: string; body: Uint8Array }[],
   ): void {
@@ -1060,7 +1179,7 @@ export class WorldSession {
   }
 
   /** Bags, equip, item use, vendor, and loot. Bodies stay unencrypted until here. */
-  private async handlePlay(opcode: number, payload: Uint8Array): Promise<WorldResult | null> {
+  async handlePlay(opcode: number, payload: Uint8Array): Promise<WorldResult | null> {
     const character = this.character;
     const inventory = this.inventory;
     if (!this.crypt || !character || !inventory) {
@@ -1136,12 +1255,12 @@ export class WorldSession {
   }
 
   /** `Map::Update` for creatures and the melee swing timers. The first session to tick advances the shared world. */
-  private updateCombat(_diff: number): void {
+  updateCombat(_diff: number): void {
     this.combat?.update(Date.now());
   }
 
   /** `WorldSession::HandleSetSelectionOpcode` → `Player::SetSelection` (`UNIT_FIELD_TARGET`). */
-  private handleSetSelection(payload: Uint8Array): WorldResult {
+  handleSetSelection(payload: Uint8Array): WorldResult {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     const character = this.character;
     if (!character || !this.crypt || payload.length < 8) {
@@ -1158,7 +1277,7 @@ export class WorldSession {
   }
 
   /** `WorldSession::HandleAttackSwingOpcode` */
-  private handleAttackSwing(payload: Uint8Array): WorldResult {
+  handleAttackSwing(payload: Uint8Array): WorldResult {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.character || !this.combat || payload.length < 8) {
       return quiet;
@@ -1168,7 +1287,7 @@ export class WorldSession {
   }
 
   /** `WorldSession::HandleAttackStopOpcode` */
-  private handleAttackStop(): WorldResult {
+  handleAttackStop(): WorldResult {
     if (this.character) {
       this.combat?.attackStop(this.character.guid);
     }
@@ -1176,7 +1295,7 @@ export class WorldSession {
   }
 
   /** `WorldSession::HandleSetSheathedOpcode` → `Unit::SetSheath` (`UNIT_FIELD_BYTES_2` byte 0). */
-  private handleSetSheathed(payload: Uint8Array): WorldResult {
+  handleSetSheathed(payload: Uint8Array): WorldResult {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     const character = this.character;
     if (!character || !this.stats || payload.length < 4) {
@@ -1193,7 +1312,7 @@ export class WorldSession {
   }
 
   /** The loot handlers' view of this player (`LootHandler.cpp` works on `GetPlayer()`). */
-  private lootContext(character: Character, inventory: Inventory): LootPlayCtx {
+  lootContext(character: Character, inventory: Inventory): LootPlayCtx {
     const combat = this.combat;
     return {
       db: this.db.characters,
@@ -1236,7 +1355,7 @@ export class WorldSession {
   }
 
   /** `Player` as `Loot` asks about it (`LootItem::AllowedForPlayer`, `Player::HasQuestForItem`, conditions). */
-  private lootPlayer(character: Character): LootPlayer {
+  lootPlayer(character: Character): LootPlayer {
     const quests = this.talk?.quests ?? null;
     const world = worldDatabase(this.world);
     const inventory = (): Inventory | null => (this.character === character ? this.inventory : null);
@@ -1273,7 +1392,7 @@ export class WorldSession {
   }
 
   /** `Player::StoreLootItem` for a currency token at the kill, queued behind the saves so it does not race the bags. */
-  private storeCurrencyLoot(character: Character, loot: Loot, lootSlot: number): void {
+  storeCurrencyLoot(character: Character, loot: Loot, lootSlot: number): void {
     const inventory = this.inventory;
     if (!inventory || this.character !== character) {
       return;
@@ -1289,7 +1408,7 @@ export class WorldSession {
   }
 
   /** The world lookups a `Loot` makes: item templates and the random enchant rolls of `LootItem`. */
-  private lootEnv(): LootEnv {
+  lootEnv(): LootEnv {
     const world = worldDatabase(this.world);
     return {
       itemProto: (entry) => lootItemProto(world, entry),
@@ -1299,7 +1418,7 @@ export class WorldSession {
   }
 
   /** `Player` as the melee code sees it. */
-  private combatPlayer(character: Character): CombatPlayer {
+  combatPlayer(character: Character): CombatPlayer {
     const self = (): boolean => this.character === character;
     return {
       guid: character.guid,
@@ -1314,7 +1433,7 @@ export class WorldSession {
         return row ? { standing: row.standing, flags: row.flags } : null;
       },
       alive: () => self() && this.deathState === "alive" && this.health > 0,
-      gameMaster: () => false,
+      gameMaster: () => this.playerFacade?.isGameMaster() ?? false,
       sitting: () => isSitState(this.standState),
       standUp: () => {
         const stood = this.applyStandState(0);
@@ -1324,7 +1443,8 @@ export class WorldSession {
       },
       moving: () => (this.moveFlags & LEEWAY_MOVE_FLAGS) !== 0 && (this.moveFlags & MOVEMENTFLAG_WALKING) === 0,
       mounted: () => false,
-      knows: (guid) => this.knownSpawns.has(guid),
+      knows: (guid) => this.mapPlayer?.haveAtClient(guid) ?? false,
+      mapObject: () => (this.mapPlayer?.isInWorld() ? (this.mapPlayer as unknown as MovementOwner) : null),
       send: (opcode, body) => {
         if (self() && this.crypt) {
           this.deliver?.(encodeServerPacket(opcode, body));
@@ -1358,19 +1478,11 @@ export class WorldSession {
           intellect: stats.getStat(3),
         });
       },
-      refreshSpawns: () => {
-        if (!self()) {
-          return;
-        }
-        for (const packet of this.spawnPackets()) {
-          this.deliver?.(packet);
-        }
-      },
     };
   }
 
   /** The `PlayerStats` values `Unit::CalculateMeleeDamage` and `RollMeleeOutcomeAgainst` read. */
-  private playerMelee(): PlayerMelee | null {
+  playerMelee(): PlayerMelee | null {
     const stats = this.stats;
     if (!stats) {
       return null;
@@ -1406,10 +1518,10 @@ export class WorldSession {
     };
   }
 
-  private readonly weaponSchools = new Map<number, [number, number]>();
+  readonly weaponSchools = new Map<number, [number, number]>();
 
   /** `item_template.dmg_type1` / `dmg_type2` for the weapon's damage entries. */
-  private weaponDamageSchool(entry: number, index: number): number {
+  weaponDamageSchool(entry: number, index: number): number {
     if (entry === 0) {
       return 0;
     }
@@ -1426,7 +1538,7 @@ export class WorldSession {
   }
 
   /** `Unit::DealDamage` on this player. Returns true when it killed them (`Unit::Kill` → `setDeathState(JustDied)`). */
-  private takeCombatDamage(amount: number): boolean {
+  takeCombatDamage(amount: number): boolean {
     const character = this.character;
     if (!character || !this.crypt || this.deathState !== "alive") {
       return false;
@@ -1444,7 +1556,7 @@ export class WorldSession {
   }
 
   /** `Unit::ModifyPower(POWER_RAGE)` from `RewardRage`, with its `SMSG_POWER_UPDATE`. */
-  private addRage(points: number): void {
+  addRage(points: number): void {
     const stats = this.stats;
     const character = this.character;
     if (!stats || !character || !this.crypt || points <= 0) {
@@ -1465,7 +1577,7 @@ export class WorldSession {
    * `KillRewarder::Reward` for a solo player plus the kill-time loot (`Unit::Kill`: `Loot::FillLoot`, `generateMoneyLoot`).
    * Returns the creature's new loot.
    */
-  private rewardKill(kill: CreatureKill): Loot | null {
+  rewardKill(kill: CreatureKill): Loot | null {
     const character = this.character;
     if (!character || !this.crypt) {
       return null;
@@ -1503,13 +1615,13 @@ export class WorldSession {
     return loot;
   }
 
-  private handleTalk(opcode: number, payload: Uint8Array): WorldResult | null {
+  handleTalk(opcode: number, payload: Uint8Array): WorldResult | null {
     const character = this.character;
     const kit = this.kit;
     if (!this.talk || !this.crypt || !character || !kit) {
       return null;
     }
-    const packets = this.talk.handle(opcode, payload, character, kit, this.knownSpawns);
+    const packets = this.talk.handle(opcode, payload, character, kit, this.mapPlayer?.getObjectVisibilityContainer().getVisibleWorldObjectsMap()?.keys() ?? []);
     if (!packets) {
       return null;
     }
@@ -1524,7 +1636,7 @@ export class WorldSession {
     };
   }
 
-  private async handleCharCreate(payload: Uint8Array): Promise<WorldResult> {
+  async handleCharCreate(payload: Uint8Array): Promise<WorldResult> {
     if (!this.crypt) {
       return { packets: [], sent: [], close: true };
     }
@@ -1578,11 +1690,12 @@ export class WorldSession {
         close: false,
       };
     }
+    await sCharacterCache.refreshCacheEntry(this.db.characters, await createdGuid(this.db.characters, draft.name));
     log("world", `created ${draft.name} race ${draft.race} class ${draft.classId}`);
     return { packets: [charCreatePacket(this.crypt, CHAR_CREATE_SUCCESS)], sent: ["SMSG_CHAR_CREATE"], close: false };
   }
 
-  private async handleCharDelete(payload: Uint8Array): Promise<WorldResult> {
+  async handleCharDelete(payload: Uint8Array): Promise<WorldResult> {
     if (!this.crypt || payload.length < 8) {
       return { packets: [], sent: [], close: true };
     }
@@ -1590,9 +1703,10 @@ export class WorldSession {
     if (this.character?.guid === guid) {
       return { packets: [charDeletePacket(this.crypt, CHAR_DELETE_FAILED)], sent: ["SMSG_CHAR_DELETE"], close: false };
     }
-    const removed = await deleteCharacter(this.db.characters, this.accountId, guid);
+    // `WorldSession::HandleCharDeleteOpcode`: the character must belong to this account, then `Player::DeleteFromDB`.
+    const removed = (await findCharacter(this.db.characters, this.accountId, guid)) !== null;
     if (removed) {
-      await refreshRealmCharacterCount(this.db.characters, this.db.login, this.accountId);
+      await DeleteFromDB({ characters: this.db.characters, login: this.db.login }, guid, this.accountId, true, false);
       log("world", `deleted character ${guid}`);
     }
     return {
@@ -1602,7 +1716,7 @@ export class WorldSession {
     };
   }
 
-  private handleMovement(opcode: number, kind: NonNullable<ReturnType<typeof movementKind>>, payload: Uint8Array): WorldResult {
+  handleMovement(opcode: number, kind: NonNullable<ReturnType<typeof movementKind>>, payload: Uint8Array): WorldResult {
     const character = this.character;
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.crypt || !character) {
@@ -1617,7 +1731,18 @@ export class WorldSession {
       }
       return quiet;
     }
-    const info = readMoveInfo(kind, payload);
+    const unit = this.unit;
+    const allowed = movementFlagsAllowed(
+      {
+        hover: unit?.hasAuraType(106 /* SPELL_AURA_HOVER */) ?? false,
+        waterWalk: unit?.hasAuraType(104 /* SPELL_AURA_WATER_WALK */) ?? false,
+        ghost: unit?.hasAuraType(95 /* SPELL_AURA_GHOST */) ?? false,
+        featherFall: unit?.hasAuraType(144 /* SPELL_AURA_FEATHER_FALL */) ?? false,
+        fly: (unit?.hasAuraType(201 /* SPELL_AURA_FLY */) ?? false) || (unit?.hasAuraType(207 /* SPELL_AURA_MOD_INCREASE_MOUNTED_FLIGHT_SPEED */) ?? false),
+      },
+      this.security,
+    );
+    const info = readMoveInfo(kind, payload, allowed);
     if (!info || (info.guid & 0xffffffffn) !== BigInt(character.guid)) {
       return quiet;
     }
@@ -1643,6 +1768,9 @@ export class WorldSession {
     character.position_y = info.y;
     character.position_z = info.z;
     character.orientation = info.orientation;
+    // `Unit::UpdatePosition` → `Map::PlayerRelocation`: the player moves between cells, its zone and area are read again, and
+    // the players and creatures that see it or are seen are updated after the visibility delay (`Map::Update`)
+    relocateOnMap(this);
     this.falling = (info.flags & 0x00001000) !== 0 || (info.flags & 0x00002000) !== 0;
     this.moveFlags = info.flags;
     this.clientMoveTime = info.time;
@@ -1667,6 +1795,11 @@ export class WorldSession {
     if (shouldResetFall(this.lastFallTime, this.lastFallZ, info.fallTime, info.z, opcode === 0x0c9)) {
       this.lastFallZ = info.z;
       this.lastFallTime = info.fallTime;
+    }
+    if (kind === "move") {
+      // `Player::UpdatePosition`: a pending zone update, then the exploration check
+      this.appendCaptured({ packets, sent, close: false }, () => this.area?.updatePosition());
+      this.fallBelowMap(packets, sent);
     }
     if (kind === "speed" && info.speed !== null) {
       const moveType = speedMoveType(opcode);
@@ -1702,10 +1835,6 @@ export class WorldSession {
         sent.push(...stood.sent);
       }
     }
-    const spawned = this.spawnPackets();
-    const visible = this.playerPackets();
-    packets.push(...spawned, ...visible);
-    sent.push(...spawned.map(() => "SMSG_UPDATE_OBJECT"), ...visible.map(() => "SMSG_UPDATE_OBJECT"));
     if (opcode === 0x0c9 && this.health !== this.maxHealth) {
       this.players.broadcast(character.guid, SMSG_UPDATE_OBJECT, healthUpdateBlock(character.guid, this.health));
     }
@@ -1725,6 +1854,42 @@ export class WorldSession {
     return { packets, sent, close: false, quiet: true };
   }
 
+  /**
+   * @ac game/Handlers/MovementHandler.cpp WorldSession::HandleMovementOpcodes (the min height check)
+   * A player below the minimum height of the map falls to the void: an alive one takes `DAMAGE_FALL_TO_VOID` (the whole health
+   * bar, logged as fall damage, ignoring immunities), a god mode GM is killed anyway; a released ghost that was not flagged out
+   * of bounds is repopped at the graveyard.
+   * @ac-skip Battleground::HandlePlayerUnderMap (battlegrounds are not ported)
+   */
+  fallBelowMap(packets: Uint8Array[], sent: string[]): void {
+    const character = this.character;
+    const crypt = this.crypt;
+    if (!character || !crypt || !isBelowMap(this)) return;
+
+    if (this.deathState === "alive") {
+      // The Oculus under map case is handled by areatrigger (5001) and should not kill the player
+      if (character.map === MAP_THE_OCULUS) return;
+
+      this.playerFacade?.setPlayerFlagOn(PLAYER_FLAGS_IS_OUT_OF_BOUNDS);
+      const damage = this.maxHealth;
+      packets.push(environmentalDamagePacket(crypt, BigInt(character.guid), damage));
+      sent.push("SMSG_ENVIRONMENTAL_DAMAGE_LOG");
+      if (!this.playerFacade?.getCommandStatus(CHEAT_GOD)) this.health = Math.max(0, this.health - damage);
+      // player can be alive if GM: Player::KillPlayer
+      this.health = 0;
+      packets.push(encodeHealth(crypt, character.guid, 0));
+      sent.push("SMSG_UPDATE_OBJECT");
+      const died = this.applyDeath(onDeath(this.deathFields()));
+      packets.push(...died.packets);
+      sent.push(...died.sent);
+      this.combat?.playerDied(character.guid);
+      log("world", `${character.name} fell below the map`);
+    } else if ((character.playerFlags & PLAYER_FLAGS_GHOST) !== 0 && (character.playerFlags & PLAYER_FLAGS_IS_OUT_OF_BOUNDS) === 0) {
+      // Rescue only released ghosts: teleporting an unreleased body would move the corpse out of instances
+      void this.playerFacade?.repopAtGraveyard().catch((error: unknown) => logError("world", `${character.name} repop below the map failed`, error));
+    }
+  }
+
   teleportTo(map: number, x: number, y: number, z: number, orientation: number): WorldResult {
     const character = this.character;
     if (!this.crypt || !character) {
@@ -1740,12 +1905,18 @@ export class WorldSession {
       this.lastFallZ = z;
       const packet = nearTeleportPacket(this.crypt, BigInt(character.guid), this.orderCounter, place);
       this.orderCounter += 1;
-      return this.withSpawns([packet], ["MSG_MOVE_TELEPORT_ACK"]);
+      relocateOnMap(this);
+      const near = this.withVisible([packet], ["MSG_MOVE_TELEPORT_ACK"]);
+      // `Player::TeleportTo`: update zone immediately
+      this.appendCaptured(near, () => this.area?.updateZoneAfterAddToMap());
+      return near;
     }
+    // `Player::TeleportTo`: remove from the old map now (the others see it go)
+    removeFromMap(this, false);
     return { packets: farTeleportPackets(this.crypt, map, place), sent: ["SMSG_TRANSFER_PENDING", "SMSG_NEW_WORLD"], close: false };
   }
 
-  private finishFarTeleport(): WorldResult {
+  finishFarTeleport(): WorldResult {
     const character = this.character;
     const pending = this.pendingTeleport;
     if (!this.crypt || !character || !pending?.far) {
@@ -1758,14 +1929,18 @@ export class WorldSession {
     character.orientation = pending.orientation;
     this.lastFallZ = pending.z;
     this.pendingTeleport = null;
-    this.knownSpawns.clear();
     character.health = this.health;
     this.saveLoggedInCharacter(character);
     log("world", `${character.name} entered map ${character.map}`);
-    return this.withSpawns(relocationPackets(this.crypt, character), ["SMSG_LOGIN_VERIFY_WORLD", "SMSG_UPDATE_OBJECT"]);
+    // `HandleMoveWorldportAckOpcode`: `Map::AddPlayerToMap` on the new map
+    addToMap(this);
+    const entered = this.withVisible(relocationPackets(this.crypt, character), ["SMSG_LOGIN_VERIFY_WORLD", "SMSG_UPDATE_OBJECT"]);
+    // `Player::SendInitialPacketsAfterAddToMap`: update zone
+    this.appendCaptured(entered, () => this.area?.updateZoneAfterAddToMap());
+    return entered;
   }
 
-  private handleCreatureQuery(payload: Uint8Array): WorldResult {
+  handleCreatureQuery(payload: Uint8Array): WorldResult {
     if (!this.crypt || !this.world || payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
@@ -1777,7 +1952,7 @@ export class WorldSession {
     };
   }
 
-  private handleGameObjectQuery(payload: Uint8Array): WorldResult {
+  handleGameObjectQuery(payload: Uint8Array): WorldResult {
     if (!this.crypt || !this.world || payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
@@ -1789,7 +1964,7 @@ export class WorldSession {
     };
   }
 
-  private handleItemQuery(payload: Uint8Array): WorldResult {
+  handleItemQuery(payload: Uint8Array): WorldResult {
     if (!this.crypt || !this.world || payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
@@ -1801,68 +1976,42 @@ export class WorldSession {
     };
   }
 
-  private withSpawns(packets: Uint8Array[], sent: string[]): WorldResult {
-    const spawned = this.spawnPackets();
-    const visible = this.playerPackets();
-    sent.push(...spawned.map(() => "SMSG_UPDATE_OBJECT"), ...visible.map(() => "SMSG_UPDATE_OBJECT"));
-    return { packets: packets.concat(spawned, visible), sent, close: false };
+  /** The packets `work` sends to this player, appended to a handler result (named by their opcode). */
+  appendCaptured(result: WorldResult, work: () => void): void {
+    for (const packet of this.capturePackets(work)) {
+      result.packets.push(packet);
+      result.sent.push(describePacketOpcode(packet));
+    }
   }
 
-  private spawnPackets(): Uint8Array[] {
-    const character = this.character;
-    if (!this.crypt || !this.world || !this.spawns || !character) {
-      return [];
-    }
-    const diff = diffVisible(
-      this.spawns,
-      this.world,
-      { map: character.map, x: character.position_x, y: character.position_y, z: character.position_z },
-      this.knownSpawns,
-      this.combat ? (spawnGuid) => this.combat?.liveView(spawnGuid, character.guid) ?? null : undefined,
-    );
-    return spawnUpdatePayloads(diff.creates, diff.gone).map((payload) => encodeServerPacket(SMSG_UPDATE_OBJECT, payload));
+  /**
+   * The result of a handler that put the player on a map or moved it across it: its packets, then what the player sees of the
+   * map (`Player::UpdateVisibilityForPlayer(true)` and the relocation notifier, run now instead of after the visibility delay so
+   * the creatures and players arrive with the loading screen, as before).
+   */
+  withVisible(packets: Uint8Array[], sent: string[]): WorldResult {
+    const result: WorldResult = { packets, sent, close: false };
+    this.appendCaptured(result, () => showWorld(this));
+    return result;
   }
 
-  private playerPackets(): Uint8Array[] {
-    const seen = this.ensureSeen();
-    if (!this.crypt || !seen) {
-      return [];
-    }
-    const diff = this.players.sync(seen);
-    return spawnUpdatePayloads(diff.creates, diff.gone).map((payload) => encodeServerPacket(SMSG_UPDATE_OBJECT, payload));
-  }
-
-  private ensureSeen(): OnlinePlayer | null {
-    if (!this.crypt || !this.character) {
-      return null;
-    }
-    if (this.seen) {
-      return this.seen;
-    }
-    const character = this.character;
-    const seen: OnlinePlayer = {
+  /** The player is in the world for the rest of the server: chat addressing, the party, and the combat world. */
+  registerOnline(character: Character): void {
+    if (!this.crypt) return;
+    this.players.bind({
       guid: character.guid,
-      known: new Set(),
-      place: () => ({ map: character.map, x: character.position_x, y: character.position_y, z: character.position_z }),
       character: () => character,
-      moveTime: () => this.clientMoveTime,
-      standState: () => (this.standState < 0 ? 0 : this.standState),
-      stats: () => this.publicFieldStats(),
+      mapPlayer: () => this.mapPlayer,
       send: (opcode, payload) => {
-        if (!this.crypt) {
-          return;
-        }
+        if (!this.crypt) return;
         this.deliver?.(encodeServerPacket(opcode, payload));
       },
-    };
-    this.seen = seen;
-    this.players.bind(seen);
+    });
     this.bindShare(character);
     this.combat?.addPlayer(this.combatPlayer(character));
-    return seen;
   }
 
-  private bindShare(character: Character): void {
+  bindShare(character: Character): void {
     const talk = this.talk;
     if (!talk) {
       return;
@@ -1893,7 +2042,7 @@ export class WorldSession {
     });
   }
 
-  private leaveWorld(): void {
+  leaveWorld(): void {
     if (!this.character) {
       return;
     }
@@ -1901,8 +2050,12 @@ export class WorldSession {
     this.combat?.removePlayer(this.character.guid);
     this.inCombat = false;
     this.talk?.setDivider(0n);
+    // `LogoutPlayer`: `Map::RemovePlayerFromMap(player, true)` (the players that see it get a destroy)
+    removeFromMap(this, true);
     this.players.leave(this.character.guid);
-    this.seen = null;
+    this.mapPlayer = null;
+    this.playerFacade = null;
+    this.area = null;
     this.character = null;
     this.kit = null;
     if (this.unit) {
@@ -1917,10 +2070,9 @@ export class WorldSession {
     this.stats = null;
     this.skills = null;
     this.regen = null;
-    this.knownSpawns.clear();
   }
 
-  private async handleNameQuery(payload: Uint8Array): Promise<WorldResult> {
+  async handleNameQuery(payload: Uint8Array): Promise<WorldResult> {
     if (!this.crypt || payload.length < 8) {
       return { packets: [], sent: [], close: false };
     }
@@ -1932,32 +2084,36 @@ export class WorldSession {
     return { packets: [nameQueryResponse(this.crypt, character)], sent: ["SMSG_NAME_QUERY_RESPONSE"], close: false };
   }
 
-  private handleQueryTime(): WorldResult {
+  handleQueryTime(): WorldResult {
     if (!this.crypt) {
       return { packets: [], sent: [], close: true };
     }
     return { packets: [queryTimeResponse(this.crypt)], sent: ["SMSG_QUERY_TIME_RESPONSE"], close: false };
   }
 
-  private handleZoneUpdate(payload: Uint8Array): WorldResult {
+  handleZoneUpdate(payload: Uint8Array): WorldResult {
     if (!this.character || payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
-    this.character.zone = new ByteReader(payload).readU32();
+    const reported = new ByteReader(payload).readU32();
+    // use server side data, but only after update the player position (`Player::UpdatePosition`)
+    if (this.area) this.area.needZoneUpdate = true;
+    // The map files of this place are not extracted, so the server has no zone for it: keep the client's.
+    if (!terrainStatusOf(this)?.zoneid) this.character.zone = reported;
     this.character.health = this.health;
     this.saveLoggedInCharacter(this.character);
     log("world", `${this.character.name} zone ${this.character.zone}`);
     return { packets: [], sent: [], close: false, quiet: true };
   }
 
-  private handleWorldStateTimer(): WorldResult {
+  handleWorldStateTimer(): WorldResult {
     if (!this.crypt) {
       return { packets: [], sent: [], close: true };
     }
     return { packets: [worldStateTimer(this.crypt)], sent: ["SMSG_WORLD_STATE_UI_TIMER_UPDATE"], close: false };
   }
 
-  private handleTimeSync(payload: Uint8Array): WorldResult {
+  handleTimeSync(payload: Uint8Array): WorldResult {
     if (payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
@@ -1974,7 +2130,7 @@ export class WorldSession {
     return { packets: [], sent: [], close: false, quiet: true };
   }
 
-  private handleStandState(payload: Uint8Array): WorldResult {
+  handleStandState(payload: Uint8Array): WorldResult {
     if (!this.crypt || !this.character || payload.length < 4) {
       return { packets: [], sent: [], close: false };
     }
@@ -1986,7 +2142,7 @@ export class WorldSession {
     return { packets: applied.packets, sent: applied.sent, close: false, quiet: !applied.changed };
   }
 
-  private applyStandState(state: number): { packets: Uint8Array[]; sent: string[]; changed: boolean } {
+  applyStandState(state: number): { packets: Uint8Array[]; sent: string[]; changed: boolean } {
     if (!this.crypt || !this.character) {
       return { packets: [], sent: [], changed: false };
     }
@@ -2004,7 +2160,7 @@ export class WorldSession {
     return { packets, sent, changed };
   }
 
-  private deathFields(): PlayerDeathFields {
+  deathFields(): PlayerDeathFields {
     const character = this.character;
     if (!character) {
       throw new Error("death fields require a logged-in character");
@@ -2036,9 +2192,13 @@ export class WorldSession {
     };
   }
 
-  private graveyardStore(): GraveyardStore {
+  graveyardStore(): GraveyardStore {
     if (this.graveyards) {
       return this.graveyards;
+    }
+    // The shared `sGraveyard` store once the server set it up; a session built without it loads its own.
+    if (sGraveyard.hasWorld()) {
+      return sGraveyard.graveyardStore();
     }
     const worldDb = worldDatabase(this.world);
     if (!worldDb) {
@@ -2053,7 +2213,7 @@ export class WorldSession {
     return this.graveyards;
   }
 
-  private encodeBodies(packets: readonly { opcode: number; body: Uint8Array }[]): { packets: Uint8Array[]; sent: string[] } {
+  encodeBodies(packets: readonly { opcode: number; body: Uint8Array }[]): { packets: Uint8Array[]; sent: string[] } {
     if (!this.crypt) {
       return { packets: [], sent: [] };
     }
@@ -2063,7 +2223,7 @@ export class WorldSession {
     };
   }
 
-  private applyDeath(died: ReturnType<typeof onDeath>): { packets: Uint8Array[]; sent: string[] } {
+  applyDeath(died: ReturnType<typeof onDeath>): { packets: Uint8Array[]; sent: string[] } {
     const character = this.character;
     if (!character) {
       return { packets: [], sent: [] };
@@ -2083,7 +2243,7 @@ export class WorldSession {
     return this.encodeBodies(died.packets);
   }
 
-  private applyResurrect(result: {
+  applyResurrect(result: {
     health: number;
     power1: number;
     playerFlags: number;
@@ -2109,7 +2269,7 @@ export class WorldSession {
     return { packets: [...encoded.packets, ...moved.packets], sent: [...encoded.sent, ...moved.sent], close: false };
   }
 
-  private async handleRepop(): Promise<WorldResult> {
+  async handleRepop(): Promise<WorldResult> {
     const character = this.character;
     if (!this.crypt || !character || this.deathState === "alive") {
       return { packets: [], sent: [], close: false, quiet: true };
@@ -2133,7 +2293,7 @@ export class WorldSession {
     return { packets: [...encoded.packets, ...moved.packets], sent: [...encoded.sent, ...moved.sent], close: false };
   }
 
-  private async handleReclaimCorpse(): Promise<WorldResult> {
+  async handleReclaimCorpse(): Promise<WorldResult> {
     if (!this.crypt || !this.character) {
       return { packets: [], sent: [], close: false, quiet: true };
     }
@@ -2144,14 +2304,14 @@ export class WorldSession {
     return this.applyResurrect(result);
   }
 
-  private async handleSpiritHealer(): Promise<WorldResult> {
+  async handleSpiritHealer(): Promise<WorldResult> {
     if (!this.crypt || !this.character) {
       return { packets: [], sent: [], close: false, quiet: true };
     }
     return this.applyResurrect(await spiritHealerResurrect(this.db.characters, this.deathFields(), this.graveyardStore()));
   }
 
-  private async handleResurrect(payload: Uint8Array): Promise<WorldResult> {
+  async handleResurrect(payload: Uint8Array): Promise<WorldResult> {
     if (!this.crypt || !this.character || payload.length < 1) {
       return { packets: [], sent: [], close: false, quiet: true };
     }
@@ -2165,7 +2325,7 @@ export class WorldSession {
     return this.applyResurrect(result);
   }
 
-  private async handleCorpseQuery(): Promise<WorldResult> {
+  async handleCorpseQuery(): Promise<WorldResult> {
     const character = this.character;
     if (!this.crypt || !character) {
       return { packets: [], sent: [], close: false, quiet: true };
@@ -2178,11 +2338,11 @@ export class WorldSession {
     };
   }
 
-  private async equipmentSetList(guid: number): Promise<Uint8Array> {
+  async equipmentSetList(guid: number): Promise<Uint8Array> {
     return equipmentSetListPacket(await loadSets(this.db.characters, guid));
   }
 
-  private async handleEquipmentSetSave(payload: Uint8Array): Promise<WorldResult> {
+  async handleEquipmentSetSave(payload: Uint8Array): Promise<WorldResult> {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.character) {
       return quiet;
@@ -2199,7 +2359,7 @@ export class WorldSession {
     return quiet;
   }
 
-  private async handleEquipmentSetDelete(payload: Uint8Array): Promise<WorldResult> {
+  async handleEquipmentSetDelete(payload: Uint8Array): Promise<WorldResult> {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.character) {
       return quiet;
@@ -2212,7 +2372,7 @@ export class WorldSession {
     return quiet;
   }
 
-  private handleLogout(): WorldResult {
+  handleLogout(): WorldResult {
     if (!this.crypt || !this.character) {
       return { packets: [], sent: [], close: true };
     }
@@ -2242,7 +2402,7 @@ export class WorldSession {
     return this.encodeLogout(decision.packets);
   }
 
-  private handleLogoutCancel(): WorldResult {
+  handleLogoutCancel(): WorldResult {
     if (!this.crypt || !this.character) {
       return { packets: [], sent: [], close: false };
     }
@@ -2250,7 +2410,7 @@ export class WorldSession {
     return this.encodeLogout(cancel().packets);
   }
 
-  private handleCastSpell(payload: Uint8Array): WorldResult {
+  handleCastSpell(payload: Uint8Array): WorldResult {
     const character = this.character;
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.crypt || !character || payload.length < 10) {
@@ -2269,7 +2429,7 @@ export class WorldSession {
    * `WorldSession::HandleCastSpellOpcode` / `Player::CastItemUseSpell`: a known, non-passive spell (or the used
    * item's spell) goes to `Spell::prepare`. Every check, cost, cooldown, and packet after that is the spell engine's.
    */
-  private castSpellRequest(castCount: number, spellId: number, targets: CastTargets, itemCast?: ItemCast): WorldResult {
+  castSpellRequest(castCount: number, spellId: number, targets: CastTargets, itemCast?: ItemCast): WorldResult {
     const character = this.character;
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     if (!this.crypt || !character) return quiet;
@@ -2316,26 +2476,43 @@ export class WorldSession {
   }
 
   /** `ItemTemplate::IsPotion` for an item in the player's inventory. */
-  private itemIsPotion(itemGuid: number): boolean {
+  itemIsPotion(itemGuid: number): boolean {
     const pos = this.inventory?.byGuid.get(itemGuid);
     const item = pos ? this.inventory?.slots.get(pos.bag)?.get(pos.slot) : undefined;
     return !!item && item.template.class === 0 && item.template.subclass === 1;
   }
 
   /** A spell-system packet for this player: straight to the socket, or into the handler's result. */
-  private sendSpellPacket(packet: Uint8Array): void {
-    if (this.deliver) this.deliver(packet);
+  sendSpellPacket(packet: Uint8Array): void {
+    if (this.captured) this.captured.push(packet);
+    else if (this.deliver) this.deliver(packet);
     else this.spellOutbox.push(packet);
   }
 
-  private drainSpellOutbox(): WorldResult {
+  /**
+   * Runs `work` and returns the packets it sent to this player instead of sending them: a handler puts them into its result,
+   * after the packets it already built (the world sends them in that order).
+   */
+  capturePackets(work: () => void): Uint8Array[] {
+    const outer = this.captured;
+    const own: Uint8Array[] = [];
+    this.captured = own;
+    try {
+      work();
+    } finally {
+      this.captured = outer;
+    }
+    return own;
+  }
+
+  drainSpellOutbox(): WorldResult {
     const packets = this.spellOutbox;
     this.spellOutbox = [];
     return { packets, sent: packets.map(() => "SPELL"), close: false, quiet: packets.length === 0 };
   }
 
   /** `WorldSession::HandleCancelCastOpcode` / `HandleCancelChanneling` */
-  private handleCancelCast(payload: Uint8Array, hasCounter: boolean): WorldResult {
+  handleCancelCast(payload: Uint8Array, hasCounter: boolean): WorldResult {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     const unit = this.unit;
     if (!this.character || !this.crypt || !unit || payload.length < (hasCounter ? 5 : 4)) return quiet;
@@ -2352,7 +2529,7 @@ export class WorldSession {
   }
 
   /** `WorldSession::HandleCancelAuraOpcode` */
-  private handleCancelAura(payload: Uint8Array): WorldResult {
+  handleCancelAura(payload: Uint8Array): WorldResult {
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     const unit = this.unit;
     if (!this.character || !this.crypt || !unit || payload.length < 4) return quiet;
@@ -2370,7 +2547,7 @@ export class WorldSession {
   }
 
   /** The `Player` side the spell unit reads and writes through (`WorldSession` owns the player state). */
-  private playerHost(character: Character): import("./player-spell-unit.ts").PlayerHost {
+  playerHost(character: Character): import("./player-spell-unit.ts").PlayerHost {
     const self = (): boolean => this.character === character;
     return {
       map: () => {
@@ -2379,6 +2556,12 @@ export class WorldSession {
         return this.soloMap;
       },
       position: () => ({ map: character.map, x: character.position_x, y: character.position_y, z: character.position_z, o: character.orientation }),
+      collisionState: () => ({
+        scale: this.playerFacade?.getObjectScale() ?? 1,
+        nativeDisplayId: this.playerFacade?.getNativeDisplayId() ?? 0,
+        mountDisplayId: this.playerFacade?.isMounted() ? this.playerFacade.getUInt32Value(UNIT_FIELD_MOUNTDISPLAYID) : 0,
+      }),
+      phaseMask: () => this.playerFacade?.getPhaseMask() ?? 1,
       level: () => character.level,
       race: () => character.race,
       classId: () => character.class,
@@ -2403,7 +2586,8 @@ export class WorldSession {
         for (const packet of applied.packets) this.sendSpellPacket(packet);
       },
       moveFlags: () => this.moveFlags,
-      gameMaster: () => false,
+      gameMaster: () => this.playerFacade?.isGameMaster() ?? false,
+      commandStatus: (command) => this.playerFacade?.getCommandStatus(command) ?? false,
       selection: () => this.selection,
       victim: () => {
         const guid = this.combat?.victimOf(character.guid);
@@ -2414,7 +2598,7 @@ export class WorldSession {
         if (self() && this.crypt) this.sendSpellPacket(encodeServerPacket(opcode, body));
       },
       broadcast: (opcode, body) => this.players.broadcast(character.guid, opcode, body),
-      knows: (guid) => !highGuidIsCreature(guid) || this.knownSpawns.has(guid),
+      knows: (guid) => !highGuidIsCreature(guid) || (this.mapPlayer?.haveAtClient(guid) ?? false),
       takeDamage: (amount) => {
         const died = this.takeCombatDamage(amount);
         if (died) this.combat?.playerDied(character.guid);
@@ -2463,7 +2647,7 @@ export class WorldSession {
     };
   }
 
-  private handleActivateTaxi(payload: Uint8Array, express: boolean): WorldResult {
+  handleActivateTaxi(payload: Uint8Array, express: boolean): WorldResult {
     const character = this.character;
     const quiet = { packets: [] as Uint8Array[], sent: [] as string[], close: false, quiet: true };
     const worldDb = worldDatabase(this.world);
@@ -2494,7 +2678,7 @@ export class WorldSession {
     return this.teleportTo(start.map, start.x, start.y, start.z, start.orientation);
   }
 
-  private applyOfflineRestOnLogin(character: Character): void {
+  applyOfflineRestOnLogin(character: Character): void {
     const worldDb = worldDatabase(this.world);
     let nextLevelXp = 0;
     if (worldDb) {
@@ -2511,7 +2695,7 @@ export class WorldSession {
     character.playerFlags = rested.playerFlags;
   }
 
-  private applyLogoutRest(character: Character): void {
+  applyLogoutRest(character: Character): void {
     const snapshot = logoutRestSnapshot(character, Math.floor(Date.now() / 1000));
     character.rest_bonus = snapshot.rest_bonus;
     character.restState = snapshot.restState;
@@ -2520,7 +2704,7 @@ export class WorldSession {
     character.playerFlags = snapshot.playerFlags;
   }
 
-  private finishLogout(already: readonly LogoutPacket[]): WorldResult {
+  finishLogout(already: readonly LogoutPacket[]): WorldResult {
     const character = this.character;
     const crypt = this.crypt;
     if (!character || !crypt) {
@@ -2536,7 +2720,7 @@ export class WorldSession {
     return this.encodeLogout(packets);
   }
 
-  private encodeLogout(packets: readonly LogoutPacket[]): WorldResult {
+  encodeLogout(packets: readonly LogoutPacket[]): WorldResult {
     if (!this.crypt) {
       return { packets: [], sent: [], close: false };
     }
@@ -2547,7 +2731,7 @@ export class WorldSession {
     };
   }
 
-  private clearLogoutTimer(): void {
+  clearLogoutTimer(): void {
     if (this.logoutTimer) {
       clearTimeout(this.logoutTimer);
       this.logoutTimer = null;
@@ -2555,7 +2739,7 @@ export class WorldSession {
   }
 
   /** `HandleTutorialFlag`, `HandleTutorialClear`, `HandleTutorialReset` (`STATUS_LOGGEDIN`). */
-  private handleTutorial(opcode: number, payload: Uint8Array): WorldResult {
+  handleTutorial(opcode: number, payload: Uint8Array): WorldResult {
     const result: WorldResult = { packets: [], sent: [], close: false };
     if (!this.character) {
       return result;
@@ -2572,7 +2756,7 @@ export class WorldSession {
     return result;
   }
 
-  private handleRealmSplit(payload: Uint8Array): WorldResult {
+  handleRealmSplit(payload: Uint8Array): WorldResult {
     if (!this.crypt || payload.length < 4) {
       return { packets: [], sent: [], close: true };
     }
@@ -2580,18 +2764,361 @@ export class WorldSession {
     return { packets: [realmSplitPacket(this.crypt, unk)], sent: ["SMSG_REALM_SPLIT"], close: false };
   }
 
-  private handleAccountDataTimes(): WorldResult {
+  handleAccountDataTimes(): WorldResult {
     if (!this.crypt) {
       return { packets: [], sent: [], close: true };
     }
     return { packets: [accountDataTimesPacket(this.crypt)], sent: ["SMSG_ACCOUNT_DATA_TIMES"], close: false };
   }
 
-  private handlePing(payload: Uint8Array): WorldResult {
+  // ------------------------------------------------------------------ account, security, and chat
+
+  /**
+   * `LOGIN_SEL_ACCOUNT_INFO_BY_NAME` (`WorldSocket::HandleAuthSession`): security for this realm, mute time, locale,
+   * flags, expansion, and whether the account is banned.
+   */
+  async loadAccountInfo(username: string): Promise<{ banned: boolean }> {
+    const [fields] = await queryFields(this.db.login, LOGIN_SEL_ACCOUNT_INFO_BY_NAME, realm.Id.Realm, upperLatin(username));
+    if (!fields) return { banned: false };
+    const worldExpansion = sWorld().getIntConfig(ServerConfig.CONFIG_EXPANSION);
+    this.expansion = Math.min(Number(fields[5] ?? 0), worldExpansion);
+    this.accountFlags = Number(fields[6] ?? 0) >>> 0;
+    let muteTime = Number(fields[7] ?? 0);
+    const locale = Number(fields[8] ?? 0);
+    this.locale = locale >= TOTAL_LOCALES ? LOCALE_enUS : locale;
+    this.security = Number(fields[12] ?? 0);
+    // Negative mutetime indicates amount of minutes to be muted effective on next login - which is now.
+    if (muteTime < 0) {
+      muteTime = Math.floor(Date.now() / 1000) + Math.abs(muteTime);
+      executeStatementAsync(this.db.login, LOGIN_UPD_MUTE_TIME_LOGIN, muteTime, Number(fields[0]));
+    }
+    this.muteTime = muteTime;
+    return { banned: Number(fields[13] ?? 0) !== 0 };
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::LoadPermissions */
+  async loadPermissions(): Promise<void> {
+    this.rbacData = new RBACData(this.accountId, this.accountName, realm.Id.Realm, this.security, sAccountMgr, this.db.login);
+    await this.rbacData.loadFromDB();
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::HasPermission */
+  hasPermission(permission: number): boolean {
+    return this.rbacData?.hasPermission(permission) ?? false;
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::GetRBACData */
+  getRBACData(): RBACData | null {
+    return this.rbacData;
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::InvalidateRBACData (reloaded at once; the C++ reloads on next use) */
+  async invalidateRBACData(): Promise<void> {
+    await this.loadPermissions();
+  }
+
+  getSecurity(): number {
+    return this.security;
+  }
+
+  /** @ac game/Server/WorldSession.h WorldSession::SetSecurity */
+  setSecurity(security: number): void {
+    this.security = security;
+  }
+
+  getAccountId(): number {
+    return this.accountId;
+  }
+
+  getAccountName(): string {
+    return this.accountName;
+  }
+
+  getAccountFlags(): number {
+    return this.accountFlags;
+  }
+
+  hasAccountFlag(flag: number): boolean {
+    return (this.accountFlags & flag) !== 0;
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::UpdateAccountFlag */
+  updateAccountFlag(flag: number, remove = false): void {
+    if (remove) this.accountFlags = (this.accountFlags & ~flag) >>> 0;
+    else this.accountFlags = (this.accountFlags | flag) >>> 0;
+    executeStatementAsync(this.db.login, LOGIN_UPD_SET_ACCOUNT_FLAG, this.accountFlags, this.accountId);
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::ValidateAccountFlags */
+  validateAccountFlags(): void {
+    const hasGMFlag = this.hasAccountFlag(ACCOUNT_FLAG_GM);
+    if (this.isGMAccount() && !hasGMFlag) this.updateAccountFlag(ACCOUNT_FLAG_GM);
+    else if (hasGMFlag && !this.isGMAccount()) this.updateAccountFlag(ACCOUNT_FLAG_GM, true);
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::IsGMAccount */
+  isGMAccount(): boolean {
+    return this.security >= SEC_GAMEMASTER;
+  }
+
+  getRemoteAddress(): string {
+    return this.remoteAddress;
+  }
+
+  getLatency(): number {
+    return this.latency;
+  }
+
+  /** @ac game/Server/WorldSession.h WorldSession::GetPlayer */
+  getPlayer(): SessionPlayer | null {
+    return this.character ? this.playerFacade : null;
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::GetPlayerName */
+  getPlayerName(): string {
+    return this.character?.name ?? "<none>";
+  }
+
+  getSessionDbcLocale(): number {
+    return this.locale;
+  }
+
+  getSessionDbLocaleIndex(): number {
+    return this.locale;
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::GetAcoreString */
+  getAcoreString(entry: number): string {
+    return sObjectMgr.getAcoreString(entry, this.getSessionDbLocaleIndex());
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::SendPacket */
+  sendPacket(opcode: number, body: Uint8Array): void {
+    if (!this.crypt) return;
+    this.sendSpellPacket(encodeServerPacket(opcode, body));
+  }
+
+  /** An already encoded packet to this session (socket, or the handler's result when there is no socket). */
+  sendRaw(packet: Uint8Array): void {
+    this.sendSpellPacket(packet);
+  }
+
+  /** @ac game/Server/WorldSession.cpp WorldSession::KickPlayer */
+  kickPlayer(reason: string): void {
+    log("world", `Account: ${this.accountId} Character: '${this.getPlayerName()}' kicked with reason: ${reason}`);
+    this.closeSocket?.();
+  }
+
+  attachClose(close: () => void): void {
+    this.closeSocket = close;
+  }
+
+  /** `CMSG_MESSAGECHAT`, `CMSG_EMOTE`, `CMSG_TEXT_EMOTE`, `CMSG_CHAT_IGNORED` (`STATUS_LOGGEDIN`). */
+  async handleChat(opcode: number, payload: Uint8Array): Promise<WorldResult> {
+    if (!this.crypt || !this.character || !this.playerFacade) {
+      return { packets: [], sent: [], close: false, quiet: true };
+    }
+    try {
+      switch (opcode) {
+        case CMSG_MESSAGECHAT:
+          await HandleMessagechatOpcode(this, payload);
+          break;
+        case CMSG_EMOTE:
+          HandleEmoteOpcode(this, payload);
+          break;
+        case CMSG_TEXT_EMOTE:
+          HandleTextEmoteOpcode(this, payload);
+          break;
+        case CMSG_CHAT_IGNORED:
+          HandleChatIgnoredOpcode(this, payload);
+          break;
+      }
+    } catch (error) {
+      logError("world", `${this.label} chat opcode failed`, error);
+    }
+    if (this.character) this.saveLoggedInCharacter(this.character);
+    return this.drainSpellOutbox();
+  }
+
+  /** The world rows (`sObjectMgr` caches). */
+  worldTables(): WorldTables | null {
+    return worldDatabase(this.world);
+  }
+
+  /**
+   * The fields `Player::LoadFromDB` / `InitDisplayIds` set that the command code changes: display, faction, scale,
+   * player flags, titles, and the honor and arena currencies.
+   */
+  initCommandFields(character: Character): void {
+    const stats = this.stats;
+    if (!stats) return;
+    const appearance = raceAppearance(character.race, character.gender);
+    stats.setFloat(OBJECT_FIELD_SCALE_X, 1);
+    stats.setFloat(UNIT_FIELD_COMBATREACH, 1.5);
+    stats.setUInt32(UNIT_FIELD_DISPLAYID, appearance.display);
+    stats.setUInt32(UNIT_FIELD_NATIVEDISPLAYID, appearance.display);
+    stats.setUInt32(UNIT_FIELD_FACTIONTEMPLATE, appearance.faction);
+    stats.setUInt32(PLAYER_FLAGS_FIELD, character.playerFlags);
+    stats.setUInt32(PLAYER_CHOSEN_TITLE, character.chosenTitle);
+    stats.setUInt32(PLAYER_FIELD_HONOR_CURRENCY, character.totalHonorPoints);
+    stats.setUInt32(PLAYER_FIELD_ARENA_CURRENCY, character.arenaPoints);
+    // `Player::_LoadExploredZones` (`PLAYER_EXPLORED_ZONES_1` .. +127)
+    const explored = (character.exploredZones ?? "").trim().split(/\s+/).filter(Boolean).map((part) => Number(part) >>> 0);
+    explored.slice(0, PLAYER_EXPLORED_ZONES_SIZE).forEach((value, index) => stats.setUInt32(PLAYER_EXPLORED_ZONES_1 + index, value));
+    const titles = (character.knownTitles ?? "").trim().split(/\s+/).filter(Boolean).map((part) => Number(part) >>> 0);
+    titles.slice(0, 6).forEach((value, index) => stats.setUInt32(PLAYER__FIELD_KNOWN_TITLES + index, value));
+    // Honor system: the kill and contribution fields, then `UpdateHonorFields` from the logout time
+    stats.setUInt32(PLAYER_FIELD_TODAY_CONTRIBUTION, character.todayHonorPoints);
+    stats.setUInt32(PLAYER_FIELD_YESTERDAY_CONTRIBUTION, character.yesterdayHonorPoints);
+    stats.setUInt32(PLAYER_FIELD_LIFETIME_HONORABLE_KILLS, character.totalKills);
+    stats.setUInt32(PLAYER_FIELD_KILLS, ((character.todayKills & 0xffff) | ((character.yesterdayKills & 0xffff) << 16)) >>> 0);
+    if (this.commandState) this.commandState.lastHonorUpdateTime = character.logout_time;
+    this.playerFacade?.updateHonorFields();
+  }
+
+  /** The GM state part of `Player::LoadFromDB`. */
+  restoreGmState(character: Character): void {
+    const player = this.playerFacade;
+    if (!player || !this.hasPermission(RBAC_PERM_RESTORE_SAVED_GM_STATE)) {
+      if (player) character.extra_flags &= ~(PLAYER_EXTRA_GM_ON | PLAYER_EXTRA_GM_INVISIBLE | PLAYER_EXTRA_GM_CHAT);
+      return;
+    }
+    const world = sWorld();
+    const extraflags = character.extra_flags;
+    character.extra_flags &= ~(PLAYER_EXTRA_GM_ON | PLAYER_EXTRA_GM_INVISIBLE | PLAYER_EXTRA_GM_CHAT | PLAYER_EXTRA_ACCEPT_WHISPERS);
+    switch (world.getIntConfig(ServerConfig.CONFIG_GM_LOGIN_STATE)) {
+      case 1:
+        player.setGameMaster(true);
+        break;
+      case 2:
+        if (extraflags & PLAYER_EXTRA_GM_ON) player.setGameMaster(true);
+        break;
+    }
+    switch (world.getIntConfig(ServerConfig.CONFIG_GM_VISIBLE_STATE)) {
+      case 0:
+        player.setGMVisible(false);
+        break;
+      case 2:
+        if (extraflags & PLAYER_EXTRA_GM_INVISIBLE) player.setGMVisible(false);
+        break;
+    }
+    switch (world.getIntConfig(ServerConfig.CONFIG_GM_CHAT)) {
+      case 1:
+        player.setGMChat(true);
+        break;
+      case 2:
+        if (extraflags & PLAYER_EXTRA_GM_CHAT) player.setGMChat(true);
+        break;
+    }
+    switch (world.getIntConfig(ServerConfig.CONFIG_GM_WHISPERING_TO)) {
+      case 1:
+        player.setAcceptWhispers(true);
+        break;
+      case 2:
+        if (extraflags & PLAYER_EXTRA_ACCEPT_WHISPERS) player.setAcceptWhispers(true);
+        break;
+    }
+  }
+
+  /** `WorldObject::UpdateObjectVisibility` for this player (others see or lose it, it sees or loses them). */
+  refreshVisibility(): void {
+    this.mapPlayer?.updateObjectVisibility(true);
+  }
+
+  /** `Unit::Kill(killer, player)`. */
+  killPlayer(): void {
+    const character = this.character;
+    if (!character) return;
+    const died = this.takeCombatDamage(this.health);
+    if (died) this.combat?.playerDied(character.guid);
+  }
+
+  /** Skill changes from a command: learned and removed spells follow, and the fields go out with the next flush. */
+  applySkillEvents(): void {
+    const skills = this.skills;
+    if (!skills) return;
+    const changes = spellChangesFromEvents(skills.drainEvents());
+    for (const spellId of changes.learn) this.playerFacade?.learnSpell(spellId);
+    for (const spellId of changes.remove ?? []) this.playerFacade?.removeSpell(spellId);
+  }
+
+  /** `ReputationMgr::SetOneFactionReputation` over `character_reputation`, then `ReputationMgr::SendState`. */
+  setFactionStanding(factionId: number, standing: number): boolean {
+    const row = this.kit?.factions.find((entry) => entry.faction === factionId);
+    const listId = sFactionStoreListId(factionId);
+    if (!row || listId < 0) return false;
+    row.standing = standing;
+    const body = new ByteWriter().writeF32(0).writeU8(0).writeU32(1).writeU32(listId).writeU32(standing >>> 0).toUint8Array();
+    this.sendPacket(0x124 /* SMSG_SET_FACTION_STANDING */, body);
+    return true;
+  }
+
+  /** `Player::DestroyItemCount` from a command: each carried stack goes through `DestroyItem`, with the removal packets. */
+  async destroyItemCountByCommand(entry: number, count: number): Promise<void> {
+    const inventory = this.inventory;
+    if (!inventory) return;
+    let left = count;
+    for (const row of carriedItems(inventory)) {
+      if (left <= 0) break;
+      if (row.entry !== entry) continue;
+      const take = Math.min(left, row.count);
+      const packetBag = row.bag === 0 ? INVENTORY_SLOT_BAG_0 : (inventory.byGuid.get(row.bag)?.slot ?? INVENTORY_SLOT_BAG_0);
+      await this.destroyItemAt(packetBag, row.slot, take >= row.count ? 0 : take);
+      left -= take;
+    }
+  }
+
+  /** @ac game/Entities/Player/PlayerStorage.cpp Player::SwapItem for two of the player's own slots (the `CMSG_SWAP_INV_ITEM` path). */
+  async swapInvItem(srcSlot: number, dstSlot: number): Promise<void> {
+    const result = await this.handlePlay(CMSG_SWAP_INV_ITEM, Uint8Array.from([srcSlot & 0xff, dstSlot & 0xff]));
+    for (const packet of result?.packets ?? []) this.sendRaw(packet);
+  }
+
+  /**
+   * @ac game/Entities/Player/PlayerStorage.cpp Player::DestroyItem (`bag` is `INVENTORY_SLOT_BAG_0` or a bag slot, as in the
+   * client packets; `count` 0 destroys the stack). The `CMSG_DESTROYITEM` path sends the removal and saves the inventory.
+   */
+  async destroyItemAt(bag: number, slot: number, count = 0): Promise<boolean> {
+    const result = await this.handlePlay(CMSG_DESTROYITEM, Uint8Array.from([bag & 0xff, slot & 0xff, count & 0xff]));
+    for (const packet of result?.packets ?? []) this.sendRaw(packet);
+    return result !== null;
+  }
+
+  /** `Player::SendNewItem` to this player and, when a GM gave it, to the GM (`received` for the target). */
+  sendItemPushResult(last: InventoryItem, lastInstance: ItemInstance | null, count: number, selfGiven: boolean, giver: SessionPlayer | { getSession(): WorldSession } | null): void {
+    const character = this.character;
+    const inventory = this.inventory;
+    if (!character || !inventory) return;
+    const pos = getItemPos(inventory, last.guid);
+    if (!pos) return;
+    const push = (received: boolean): Uint8Array =>
+      buildItemPushResult({
+        playerGuid: BigInt(character.guid),
+        received,
+        created: !received,
+        sendChatMessage: true,
+        bagSlot: bagSlotOf(inventory, pos.bag),
+        slot: last.count === count ? pos.slot : -1,
+        entry: last.entry,
+        suffixFactor: lastInstance?.propertySeed ?? 0,
+        randomPropertyId: lastInstance?.randomPropertyId ?? 0,
+        count,
+        inventoryCount: getItemCount(inventory, last.entry),
+      });
+    // `p->SendNewItem(item, count, false, true)` to the GM, then `playerTarget->SendNewItem(item, count, true, false)`.
+    if (giver && !selfGiven) giver.getSession().sendPacket(0x166 /* SMSG_ITEM_PUSH_RESULT */, push(false));
+    this.sendPacket(0x166 /* SMSG_ITEM_PUSH_RESULT */, push(!selfGiven));
+  }
+
+  handlePing(payload: Uint8Array): WorldResult {
     if (!this.crypt || payload.length < 4) {
       return { packets: [], sent: [], close: true };
     }
-    const ping = new ByteReader(payload).readU32();
+    const reader = new ByteReader(payload);
+    const ping = reader.readU32();
+    if (reader.remaining >= 4) {
+      this.latency = reader.readU32();
+    }
     return { packets: [pongPacket(this.crypt, ping)], sent: ["SMSG_PONG"], close: false };
   }
 }
@@ -2656,6 +3183,12 @@ export function describeWorldOpcode(opcode: number): string {
   return `${worldOpcodeName(opcode)} (${hexOpcode(opcode)})`;
 }
 
+/** The opcode name of an encoded (not yet sealed) server packet. */
+function describePacketOpcode(packet: Uint8Array): string {
+  const at = (packet[0]! & 0x80) !== 0 ? 3 : 2;
+  return worldOpcodeName(packet[at]! | (packet[at + 1]! << 8));
+}
+
 /** `MOVEMENTFLAG_FORWARD | STRAFE_LEFT | STRAFE_RIGHT | FALLING` for `GetLeewayBonusRangeForTargets`. */
 const LEEWAY_MOVE_FLAGS = 0x00000001 | 0x00000004 | 0x00000008 | 0x00001000;
 const MOVEMENTFLAG_WALKING = 0x00000100;
@@ -2672,6 +3205,19 @@ function isSitState(state: number): boolean {
 
 function encodeHealth(crypt: WorldCrypt, characterId: number, health: number): Uint8Array {
   return encodeServerPacket(0x0a9, healthUpdateBlock(characterId, health));
+}
+
+export const PLAYER_EXPLORED_ZONES_SIZE = 128;
+
+/** `FactionEntry::reputationListID` from `Faction.dbc` (-1 when the faction has no list slot). */
+function sFactionStoreListId(factionId: number): number {
+  return sFactionStore.lookupEntry(factionId)?.reputationListID ?? -1;
+}
+
+/** The guid of a character just created (`characters.name` is unique). */
+async function createdGuid(db: Db, name: string): Promise<number> {
+  const [row] = await queryFields(db, "SELECT guid FROM characters WHERE name = ?", name);
+  return row ? Number(row[0]) : 0;
 }
 
 function worldDatabase(world: { tables?: () => WorldTables } | null): WorldTables | null {

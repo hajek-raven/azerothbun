@@ -95,48 +95,6 @@ export function lootListPacket(creature: bigint): Uint8Array {
 
 export type Vec3 = { x: number; y: number; z: number };
 
-/**
- * `SMSG_MONSTER_MOVE` with a linear path of one segment (`PacketBuilder::WriteMonsterMove`).
- * `facingTarget` sends `MonsterMoveFacingTarget`; `stop` sends `MonsterMoveStop`.
- */
-export function monsterMovePacket(options: {
-  guid: bigint;
-  splineId: number;
-  from: Vec3;
-  to?: Vec3;
-  durationMs?: number;
-  facingTarget?: bigint;
-  facingAngle?: number;
-  stop?: boolean;
-}): Uint8Array {
-  const body = new ByteWriter()
-    .writeBytes(packedGuid(options.guid))
-    .writeU8(0)
-    .writeF32(options.from.x)
-    .writeF32(options.from.y)
-    .writeF32(options.from.z)
-    .writeU32(options.splineId >>> 0);
-  if (options.stop) {
-    return body.writeU8(1).toUint8Array();
-  }
-  if (options.facingTarget !== undefined) {
-    body.writeU8(3).writeU64(options.facingTarget);
-  } else if (options.facingAngle !== undefined) {
-    body.writeU8(4).writeF32(options.facingAngle);
-  } else {
-    body.writeU8(0);
-  }
-  const to = options.to ?? options.from;
-  return body
-    .writeU32(0)
-    .writeU32(Math.max(0, Math.round(options.durationMs ?? 0)))
-    .writeU32(1)
-    .writeF32(to.x)
-    .writeF32(to.y)
-    .writeF32(to.z)
-    .toUint8Array();
-}
-
 const OBJECT_END = 0x0006;
 const UNIT_END = OBJECT_END + 0x008e;
 

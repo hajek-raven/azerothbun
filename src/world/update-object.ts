@@ -238,12 +238,12 @@ export function packedGuid(guid: bigint): Uint8Array {
   return Uint8Array.of(mask, ...bytes);
 }
 
-function raceAppearance(race: number, gender: number): { faction: number; display: number } {
+export function raceAppearance(race: number, gender: number): { faction: number; display: number } {
   const row = RACES.get(race) ?? RACES.get(1)!;
   return { faction: row.faction, display: gender === 1 ? row.female : row.male };
 }
 
-function powerType(classId: number): number {
+export function powerType(classId: number): number {
   if (classId === 1) {
     return 1;
   }

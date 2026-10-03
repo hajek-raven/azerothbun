@@ -7,6 +7,7 @@ import type { Character } from "../db.ts";
 import { WorldCrypt } from "../crypto/world-crypt.ts";
 import { writeCharEnumGear, type CharEnumGearSlot } from "../characters/char-enum-gear.ts";
 import { playerCreateBlock, type PlayerFieldStats } from "./update-object.ts";
+import { AT_LOGIN_RENAME, AT_LOGIN_RESURRECT, PLAYER_FLAGS_GHOST, PLAYER_FLAGS_HIDE_CLOAK, PLAYER_FLAGS_HIDE_HELM } from "../game/Entities/Player/PlayerDefines.ts";
 import {
   actionButtonsPacket,
   bindPointPacket,
@@ -85,6 +86,8 @@ export const SMSG_STANDSTATE_UPDATE = 0x29d;
 
 export const AUTH_OK = 0x0c;
 export const AUTH_FAILED = 0x0d;
+export const AUTH_UNAVAILABLE = 0x10;
+export const AUTH_BANNED = 0x1c;
 export const CLIENT_HEADER_SIZE = 6;
 export const SERVER_HEADER_SIZE = 4;
 const EQUIPMENT_SLOTS = 23;
@@ -234,13 +237,34 @@ export function pongPacket(crypt: WorldCrypt, ping: number): Uint8Array {
   return encodeServerPacket(SMSG_PONG, new ByteWriter().writeU32(ping).toUint8Array());
 }
 
+/** `CharacterFlags` (Player.cpp) */
+const CHARACTER_FLAG_HIDE_HELM = 0x00000400;
+const CHARACTER_FLAG_HIDE_CLOAK = 0x00000800;
+const CHARACTER_FLAG_GHOST = 0x00002000;
+const CHARACTER_FLAG_RENAME = 0x00004000;
+const CHARACTER_FLAG_LOCKED_BY_BILLING = 0x01000000;
+const CHARACTER_FLAG_DECLINED = 0x02000000;
+
 export function charEnumPacket(
   crypt: WorldCrypt,
   characters: Character[],
   gearByGuid: ReadonlyMap<number, readonly CharEnumGearSlot[]> = new Map(),
+  bannedGuids: ReadonlySet<number> = new Set(),
+  declinedNamesUsed = false,
 ): Uint8Array {
   const body = new ByteWriter().writeU8(characters.length);
   for (const character of characters) {
+    // `Player::BuildEnumData` character flags
+    let playerFlags = character.playerFlags;
+    let charFlags = 0;
+    if (character.at_login & AT_LOGIN_RESURRECT) playerFlags &= ~PLAYER_FLAGS_GHOST;
+    if (playerFlags & PLAYER_FLAGS_HIDE_HELM) charFlags |= CHARACTER_FLAG_HIDE_HELM;
+    if (playerFlags & PLAYER_FLAGS_HIDE_CLOAK) charFlags |= CHARACTER_FLAG_HIDE_CLOAK;
+    if (playerFlags & PLAYER_FLAGS_GHOST) charFlags |= CHARACTER_FLAG_GHOST;
+    if (character.at_login & AT_LOGIN_RENAME) charFlags |= CHARACTER_FLAG_RENAME;
+    if (bannedGuids.has(character.guid)) charFlags |= CHARACTER_FLAG_LOCKED_BY_BILLING;
+    // Declined names (`character_declinedname`) are only read when `DeclinedNames` is on.
+    if (!declinedNamesUsed) charFlags |= CHARACTER_FLAG_DECLINED;
     body
       .writeU64(BigInt(character.guid))
       .writeCString(character.name)
@@ -259,7 +283,7 @@ export function charEnumPacket(
       .writeF32(character.position_y)
       .writeF32(character.position_z)
       .writeU32(0)
-      .writeU32(0)
+      .writeU32(charFlags >>> 0)
       .writeU32(0)
       .writeU8(1)
       .writeU32(0)

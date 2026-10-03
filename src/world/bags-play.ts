@@ -8,7 +8,7 @@ import type { Db } from "../database/database.ts";
 import { characters, item_instance } from "../database/schema/characters.ts";
 import { item_template } from "../database/schema/world.ts";
 import type { WorldTables } from "../database/world-tables.ts";
-import { objectGuids } from "../game/globals/object-guids.ts";
+import { objectGuids } from "../game/Globals/object-guids.ts";
 import {
   applyInventoryRows,
   autoBankItem,

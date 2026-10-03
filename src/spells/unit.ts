@@ -3,6 +3,8 @@ import { packedGuid } from "../world/update-object.ts";
 import { Aura, AuraApplication, AuraEffect } from "./aura.ts";
 import {
   SPELL_ATTR0_NO_IMMUNITIES,
+  SPELL_ATTR0_ONLY_INDOORS,
+  SPELL_ATTR0_ONLY_OUTDOORS,
   SPELL_ATTR1_IMMUNITY_TO_HOSTILE_AND_FRIENDLY_EFFECTS,
   SPELL_ATTR2_NO_SCHOOL_IMMUNITIES,
   SPELL_ATTR3_ALWAYS_HIT,
@@ -100,6 +102,9 @@ import type { SpellStore } from "./spell-info.ts";
 import { emptyTargets, SMSG_CLEAR_COOLDOWN, TARGET_FLAG_DEST_LOCATION, TARGET_FLAG_UNIT, type CastTargets } from "./packets.ts";
 import { Spell, type CastItem } from "./spell.ts";
 import * as UnitMath from "./unit-math.ts";
+import { DEFAULT_COLLISION_HEIGHT } from "../game/Entities/Object/ObjectDefines.ts";
+import { isWithinLOS, isWithinLOSInMap, type LineOfSightObject } from "../game/Maps/MapLineOfSight.ts";
+import { LINEOFSIGHT_ALL_CHECKS, ModelIgnoreFlags } from "../game/Grids/MapLike.ts";
 
 export type Point = { x: number; y: number; z: number };
 export type UnitPosition = Point & { map: number; o: number };
@@ -259,6 +264,47 @@ export abstract class SpellUnit {
   abstract isInPartyWith(other: SpellUnit, raid: boolean): boolean;
   /** `GetCharmerOrOwner` */
   abstract charmerOrOwner(): SpellUnit | null;
+
+  /** `Unit::GetCollisionHeight`: the default; players and creatures read the model of their display. */
+  collisionHeight(): number {
+    return DEFAULT_COLLISION_HEIGHT;
+  }
+
+  /** `WorldObject::GetPhaseMask` (the phase the unit is seen in). */
+  get phaseMask(): number {
+    return 1;
+  }
+
+  /** `WorldObject::GetInstanceId` (0 for a world map). */
+  get instanceId(): number {
+    return 0;
+  }
+
+  /** The place and size `WorldObject::IsWithinLOS` reads. */
+  losObject(): LineOfSightObject {
+    const at = this.position();
+    return {
+      map: at.map,
+      instance: this.instanceId,
+      phaseMask: this.phaseMask,
+      isPlayer: this.isPlayer,
+      x: at.x,
+      y: at.y,
+      z: at.z,
+      collisionHeight: this.collisionHeight(),
+      combatReach: this.combatReach,
+    };
+  }
+
+  /** `WorldObject::IsWithinLOS` */
+  isWithinLOS(x: number, y: number, z: number, ignoreFlags: number = ModelIgnoreFlags.Nothing, checks: number = LINEOFSIGHT_ALL_CHECKS): boolean {
+    return isWithinLOS(this.losObject(), x, y, z, ignoreFlags, checks);
+  }
+
+  /** `WorldObject::IsWithinLOSInMap` */
+  isWithinLOSInMap(target: SpellUnit, ignoreFlags: number = ModelIgnoreFlags.Nothing, checks: number = LINEOFSIGHT_ALL_CHECKS): boolean {
+    return isWithinLOSInMap(this.losObject(), target.losObject(), ignoreFlags, checks);
+  }
 
   get isCreature(): boolean {
     return !this.isPlayer;
@@ -946,6 +992,29 @@ export abstract class SpellUnit {
     for (const app of [...this.appliedAuras]) this.removeAuraApplication(app);
   }
 
+  /**
+   * `Player::CheckAreaExploreAndOutdoor` (the `CONFIG_VMAP_INDOOR_CHECK` part): the player went outdoors or indoors. Auras whose
+   * spell is `SPELL_ATTR0_ONLY_INDOORS` (going outdoors) or `SPELL_ATTR0_ONLY_OUTDOORS` (going indoors) end, a passive one only
+   * turns its effects off; passive auras of the other kind turn their effects on.
+   */
+  updateOutdoorsAuras(isOutdoor: boolean): void {
+    const attrToRemove = isOutdoor ? SPELL_ATTR0_ONLY_INDOORS : SPELL_ATTR0_ONLY_OUTDOORS;
+    const attrToRecalculate = isOutdoor ? SPELL_ATTR0_ONLY_OUTDOORS : SPELL_ATTR0_ONLY_INDOORS;
+    for (const app of [...this.appliedAuras]) {
+      if (app.removeMode || !this.appliedAuras.includes(app)) continue;
+      const aura = app.base;
+      const attributes = aura.spellInfo.attributes[0] ?? 0;
+      if (attributes & attrToRemove) {
+        // if passive - do not remove and just turn off all effects
+        if (aura.isPassive()) aura.handleAllEffects(app, AURA_EFFECT_HANDLE_REAL, false);
+        else this.removeAuraApplication(app);
+      } else if (attributes & attrToRecalculate && aura.isPassive()) {
+        // if passive - turn on all effects
+        aura.handleAllEffects(app, AURA_EFFECT_HANDLE_REAL, true);
+      }
+    }
+  }
+
   /** `Unit::RemoveEvadeAuras` */
   removeEvadeAuras(): void {
     if (this.isControlledByPlayer()) return;
@@ -1342,6 +1411,19 @@ export abstract class SpellUnit {
 
   // ------------------------------------------------------------------ spells
 
+  /** `Unit::IsMovementPreventedByCasting` */
+  isMovementPreventedByCasting(): boolean {
+    // can always move when not casting
+    if (!this.hasUnitState(UNIT_STATE_CASTING)) return false;
+
+    // channeled spells during channel stage (after the initial cast timer) allow movement with a specific spell attribute
+    const channel = this.currentSpells[CURRENT_CHANNELED_SPELL];
+    if (channel && channel.state === 2 /* SPELL_STATE_CASTING */ && isActionAllowedChannelSpell(channel.info)) return false;
+
+    // prohibit movement for all other spell casts
+    return true;
+  }
+
   /** `Unit::IsNonMeleeSpellCast` */
   isNonMeleeSpellCast(withDelayed: boolean, skipChanneled = false, skipAutorepeat = false, isAutoshot = false): boolean {
     const generic = this.currentSpells[CURRENT_GENERIC_SPELL];
@@ -1547,6 +1629,11 @@ export abstract class SpellUnit {
 
   /** `CHEAT_GOD` (players only). */
   isGodMode(): boolean {
+    return false;
+  }
+
+  /** `Player::GetCommandStatus` (the `.cheat` flags; players only). */
+  getCommandStatus(_command: number): boolean {
     return false;
   }
 

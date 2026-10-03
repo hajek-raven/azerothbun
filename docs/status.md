@@ -11,36 +11,39 @@ Checklist for a 1:1 port of this AzerothCore tree. The client is WoW **3.3.5a bu
 - [x] Hot reload that closes the previous listeners
 - [x] World tick for game time, the shutdown timer, and update-time stats
 - [x] World tick that updates each session (player regeneration)
-- [ ] World tick that updates maps, respawns, auras, and scripts
+- [x] World tick that updates maps (`World::Update` runs the sessions, then `MapMgr::Update`: grids, respawns, visibility delays)
+- [ ] World tick that updates auras of creatures, scripts, and the other managers `World::Update` runs
 - [x] Server config for rates, distances, and limits (`configs/worldserver.conf`, `configs/authserver.conf`, `AC_` env)
 - [x] WDBC reader for Spell, Faction, SkillLineAbility, SkillRaceClassInfo, CharStartOutfit, ChrClasses, and ChrRaces from `data/dbc`
-- [ ] DBC stores the rest of the logic reads (map, talent, taxi, achievement, item display, and the rest)
-- [ ] Map height, liquid, vmaps, and pathfinding mmaps
-- [x] Console: `server shutdown` and `account create`
+- [x] DBC stores (`DBCStores.gen.ts`, every store but AchievementCriteria, GtOCTRegenMP, ItemCondExtCosts, and Spell, which `SpellStore` reads)
+- [x] Map height, liquid, vmaps, and mmaps: terrain, vmap, and nav mesh data load with the grids (`vmap.*`, `MoveMaps.Enable`, `DataDir`, the `disables` table); height, liquid, zone, and area are read from them. Creatures path over the nav mesh (chase, evade home, wander, waypoints), verified over the Northshire data
+- [x] Console: the chat command tree through `CliHandler`
 - [x] SFMT random, event processor, event map, task scheduler, timers, and string/money/utf8 helpers
-- [ ] In-game GM commands, and the rest of the console command set
+- [x] Chat command framework (`ChatCommand`, `command` table overrides, RBAC, hyperlink arguments, help) and these command files: `cs_account`, `cs_bag`, `cs_ban`, `cs_cache`, `cs_cast`, `cs_character` (no `pdump`), `cs_cheat`, `cs_gear`, `cs_gm`, `cs_go`, `cs_honor`, `cs_inventory`, `cs_item` (no `restore`), `cs_learn` (no `all my class`/`talents`), `cs_list`, `cs_lookup`, `cs_message`, `cs_misc`, `cs_modify`, `cs_player`, `cs_player_settings`, `cs_quest`, `cs_rbac`, `cs_reset`, `cs_server`, `cs_tele`, `cs_titles`
+- [ ] Command files that wait for their systems: `cs_achievement`, `cs_arena`, `cs_autobroadcast`, `cs_bf`, `cs_chatfilter`, `cs_debug`, `cs_deserter`, `cs_disable`, `cs_event`, `cs_gobject` and `cs_npc` (runtime spawn add/delete), `cs_group`, `cs_guild`, `cs_instance`, `cs_lfg`, `cs_mail`, `cs_mmaps`, `cs_pet`, `cs_pool`, `cs_pooltools`, `cs_reload`, `cs_send`, `cs_spectator`, `cs_spellinfo`, `cs_ticket`, `cs_worldstate`, `cs_wp`, `.pdump`, `.item restore`, and the talent parts of `cs_learn`
 
 ## Auth
 
 - [x] SRP6 logon challenge, proof, and reconnect
 - [x] Realm list for build 12340
 - [ ] Create an account from the client (seeded accounts are `TEST` and `TEST2`)
-- [ ] Ban, mute, IP ban, IP lock, and failed-logon lockout
-- [ ] RBAC permissions
+- [x] Account bans and mutes at world login (`AUTH_BANNED`, delayed mutes), banned characters locked in the character list, and `BanMgr`
+- [ ] Bans, IP bans, IP lock, and failed-logon lockout at the auth server
+- [x] RBAC permissions (`rbac_*` tables, per-account grants and denies, security levels)
 - [ ] Auth logs, uptime, and realm character counts written while the server runs
 - [x] Full `db_auth` tables, including realm list, bans, mutes, RBAC, logs, motd, and uptime
 
 ## Characters
 
 - [x] Enumerate the seeded level 1 human warrior
-- [x] Create and delete a character from `playercreateinfo`
-- [ ] Rename, customize, faction change, and race change
+- [x] Create a character from `playercreateinfo`, and delete it with `Player::DeleteFromDB` (remove or unlink, `CharDelete.Method`)
+- [ ] Rename, customize, faction change, and race change (the commands set the `at_login` flags; the login side is still open, except `AT_LOGIN_RESURRECT`)
 - [x] Full `characters` row loaded and saved for place and health: money, flags, taxi mask, explored zones, watched faction, and the rest of the columns
 - [x] Gear shown on the character list
 - [x] Rest state, logout timer, and combat logout
 - [x] Death, corpse, resurrect, and graveyards
 - [x] Experience, level up (`SMSG_LOG_XPGAIN`, `SMSG_LEVELUP_INFO`, new stats, talent points), and rested XP on kills
-- [ ] Exploration XP (needs area ids from map data)
+- [x] Exploration XP: zone and area from the map data, the explored zone bits, `SMSG_EXPLORATION_EXPERIENCE`, the rest flags of cities and rest areas
 - [ ] Talents, dual spec, and glyphs
 - [ ] Action bars and macros that persist
 - [x] Skills and skill caps: `character_skills`, `playercreateinfo_skills`, SkillLine / SkillRaceClassInfo / SkillTiers, level caps, and language skills
@@ -66,7 +69,8 @@ Checklist for a 1:1 port of this AzerothCore tree. The client is WoW **3.3.5a bu
 - [x] Spells and action buttons filled from the character
 - [ ] Factions are filled when `data/dbc` is present; talents, achievements, and equipment sets are still empty
 - [ ] Cinematic and taxi nodes on first login
-- [ ] Motd and feature-system flags from config
+- [x] Motd (`motd` table, `SMSG_MOTD`)
+- [ ] Feature-system flags from config
 - [x] Bind point from `character_homebind`
 
 ## Movement
@@ -78,23 +82,23 @@ Checklist for a 1:1 port of this AzerothCore tree. The client is WoW **3.3.5a bu
 - [x] Near and far teleport packets
 - [x] A spell, taxi, hearth, or command that actually starts a teleport
 - [x] Broadcast movement to other players
-- [ ] Server splines, charge, knockback, and root
-- [ ] Swim, fly, and water walk only while an aura allows them
-- [ ] Ground height, liquid, and not falling through the world
+- [x] Server splines for creatures (`MoveSplineInit`: `SMSG_MONSTER_MOVE` to the players in range, the spline in the creature create block)
+- [ ] Charge, knockback, and root for players (the player has an idle `MotionMaster` only; no taxi, charge, or knockback trigger)
+- [x] Hover, water walk, feather fall, and fly flags only while an aura allows them (fly also for GM accounts)
+- [x] Ground height, liquid, and not falling through the world (below the minimum height of the map a player takes fall-to-void damage; a ghost is sent to the graveyard; `.gps` shows the liquid)
 - [ ] Transports and elevators as the mover
 - [ ] Teleport and wall-climb checks beyond the speed cap
 
 ## Maps and visibility
 
-- [x] Spawn creatures and gameobjects within 100 yards on continents and 170 in instances
-- [x] Destroy them when they leave that range
-- [x] Show phase bit 1 and normal spawn-mask bit 0 only
-- [ ] Grid load, unload, and active objects
-- [ ] Battleground visibility at 250 yards
-- [ ] Phases from auras, quests, and GM, not a fixed mask of 1
-- [ ] Dungeon and raid spawn modes (heroic, 10, 25)
-- [ ] Creatures and objects flagged visible from the whole map
-- [x] Other players: create, update, and destroy within the same visibility range as creatures
+- [x] Spawn creatures and gameobjects from the grids around the player (`GridObjectLoader`; 100 yards on continents, 170 in instances) and destroy them when they leave range or their grid unloads
+- [x] Phase from the spawn's `phaseMask` and the player's phase (`.modify phase`, GM mode shows every phase)
+- [x] Grid load, unload, and active objects (`Map` / `MapGridManager` over the session's player; the visibility delay of `DynamicVisibilityMgr`)
+- [x] Battleground and arena visibility at 250 yards (`Visibility.Distance.BGArenas` on `BattlegroundMap`; battlegrounds themselves are not ported)
+- [ ] Phases from auras and quests (only the spawn phase and GM phase exist)
+- [x] Dungeon and raid spawn modes (heroic, 10, 25): the grid loader reads the spawn mode of the map
+- [x] Creatures and objects flagged visible from the whole map (`visibilityDistanceType` far visible and zone wide containers)
+- [x] Other players: create, update, and destroy through the same grid notifiers and visibility containers as creatures
 - [ ] Gear, auras, and sheath state on other players
 
 ## World data
@@ -115,8 +119,9 @@ Checklist for a 1:1 port of this AzerothCore tree. The client is WoW **3.3.5a bu
 
 - [x] Create packet with model, faction, saved health, speeds, and virtual weapons
 - [x] Creature query
-- [ ] Stand, wander, and follow waypoints
-- [ ] Formations, escorts, and linked pulls
+- [x] Stand, wander, and follow waypoints (`creature.MovementType`, `wander_distance`, `waypoint_data`, `creature_addon.path_id`, `creature_template_movement`, `creature_movement_override`)
+- [x] Formations (`creature_formations`: a member follows its leader along the leader's waypoint path)
+- [ ] Escorts and linked pulls
 - [x] Respawn and corpse decay (`Corpse.Decay.*`, faster once looted, `spawntimesecs`)
 - [x] Aggro, threat, leash, evade, and call for help (proximity aggro for reputation factions needs `Faction.dbc` in `data/dbc`)
 - [x] Melee attacks, chase, and facing
@@ -228,7 +233,8 @@ Detailed gap inventory: [spell-system-gaps.md](spell-system-gaps.md).
 
 ## Chat and social
 
-- [ ] Say, yell, whisper, emote, party, raid, guild, and officer
+- [x] Say, yell, whisper, emote, and text emote, with GM chat tags, AFK/DND, and mutes
+- [ ] Party, raid, guild, and officer chat
 - [ ] Custom channels, moderation, and bans
 - [ ] Friends, ignore, and who
 - [ ] Chat filter
@@ -268,7 +274,8 @@ Detailed gap inventory: [spell-system-gaps.md](spell-system-gaps.md).
 - [ ] Battleground queue, start, score, and leave
 - [ ] Arenas, teams, and seasons
 - [ ] Outdoor PvP and world PvP objectives
-- [ ] Honor, marks, and deserter
+- [x] Honor points, honorable kills, and today/yesterday contribution (`RewardHonor`, `UpdateHonorFields`)
+- [ ] Marks and deserter
 - [ ] Wintergrasp
 - [ ] Arena spectator
 
@@ -299,7 +306,8 @@ Detailed gap inventory: [spell-system-gaps.md](spell-system-gaps.md).
 
 ## GM, tickets, and Warden
 
-- [ ] Tickets and GM security
+- [x] GM mode, visibility, whisper and chat flags, and GM security checks on commands
+- [ ] Tickets
 - [ ] Warden
 - [ ] Bug reports and lag reports
 - [ ] Refer-a-friend

@@ -729,6 +729,24 @@ async function handleRepairItem(payload: Uint8Array, ctx: VendorPlayCtx): Promis
   return { packets, money: ctx.money };
 }
 
+/**
+ * @ac game/Entities/Player/PlayerStorage.cpp Player::DurabilityRepairAll (`cost` false: `.gear repair` repairs every item
+ * for free) — the repaired items' values.
+ */
+export async function durabilityRepairAllFree(db: Db, world: WorldTables, inventory: Inventory): Promise<PlayPacket[]> {
+  const packets: PlayPacket[] = [];
+  for (const [, bagSlots] of inventory.slots) {
+    for (const [, invItem] of bagSlots) {
+      const r = await toRepairable(db, world, invItem);
+      if (!r || r.maxDurability <= 0 || r.durability >= r.maxDurability) continue;
+      await applyDurability(db, world, invItem.guid, r.maxDurability, r.maxDurability);
+      const instance = await loadItem(db, world, invItem.guid);
+      if (instance) packets.push(pkt(SMSG_UPDATE_OBJECT, "SMSG_UPDATE_OBJECT", writeItemValues(instance)));
+    }
+  }
+  return packets;
+}
+
 // --- helpers -----------------------------------------------------------------
 
 function pkt(opcode: number, name: string, body: Uint8Array): PlayPacket {

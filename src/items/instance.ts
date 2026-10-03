@@ -3,7 +3,7 @@ import type { Db } from "../database/database.ts";
 import { item_instance } from "../database/schema/characters.ts";
 import { item_enchantment_template, item_template } from "../database/schema/world.ts";
 import type { WorldTables } from "../database/world-tables.ts";
-import { objectGuids } from "../game/globals/object-guids.ts";
+import { objectGuids } from "../game/Globals/object-guids.ts";
 import { irand, randChance } from "../common/random.ts";
 import { ByteWriter } from "../net/byte-buffer.ts";
 import { packedGuid } from "../world/update-object.ts";

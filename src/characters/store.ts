@@ -8,7 +8,7 @@ import {
   character_spell,
   characters,
 } from "../database/schema/characters.ts";
-import { objectGuids } from "../game/globals/object-guids.ts";
+import { objectGuids } from "../game/Globals/object-guids.ts";
 
 export type CharacterDraft = {
   accountId: number;

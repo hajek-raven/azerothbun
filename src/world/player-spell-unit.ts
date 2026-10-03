@@ -1,3 +1,5 @@
+import { GetCollisionHeight, type UnitCollisionState } from "../game/Entities/Unit/UnitCollision.ts";
+import { CHEAT_GOD } from "../game/Entities/Player/PlayerDefines.ts";
 import {
   CR_CRIT_TAKEN_MELEE,
   EQUIPMENT_SLOT_OFFHAND,
@@ -46,6 +48,11 @@ const UNIT_FIELD_AURASTATE = OBJECT_END + 0x0037;
 export type PlayerHost = {
   map(): SpellMap;
   position(): UnitPosition;
+  /** `Unit::GetNativeDisplayId`, the mount display, and the scale (`Unit::GetCollisionHeight`). */
+  collisionState?(): UnitCollisionState;
+  /** `WorldObject::GetPhaseMask` and `GetInstanceId` */
+  phaseMask?(): number;
+  instanceId?(): number;
   level(): number;
   race(): number;
   classId(): number;
@@ -60,6 +67,8 @@ export type PlayerHost = {
   setStandState(state: number): void;
   moveFlags(): number;
   gameMaster(): boolean;
+  /** `Player::GetCommandStatus` (`.cheat` flags). */
+  commandStatus(command: number): boolean;
   selection(): bigint;
   victim(): SpellUnit | null;
   attackStop(): void;
@@ -374,6 +383,19 @@ export class PlayerSpellUnit extends SpellUnit implements ReactionSource {
     return 1.5;
   }
 
+  override collisionHeight(): number {
+    const state = this.host.collisionState?.();
+    return state ? GetCollisionHeight(state) : super.collisionHeight();
+  }
+
+  override get phaseMask(): number {
+    return this.host.phaseMask?.() ?? 1;
+  }
+
+  override get instanceId(): number {
+    return this.host.instanceId?.() ?? 0;
+  }
+
   get boundingRadius(): number {
     return 0.389;
   }
@@ -685,7 +707,11 @@ export class PlayerSpellUnit extends SpellUnit implements ReactionSource {
   }
 
   override isGodMode(): boolean {
-    return false;
+    return this.host.commandStatus(CHEAT_GOD);
+  }
+
+  override getCommandStatus(command: number): boolean {
+    return this.host.commandStatus(command);
   }
 
   override leewayMoving(): boolean {

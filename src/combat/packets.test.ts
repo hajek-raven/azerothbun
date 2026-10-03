@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ByteReader } from "../net/byte-buffer.ts";
 import { HITINFO_AFFECTS_VICTIM, HITINFO_BLOCK, HITINFO_CRITICALHIT, VICTIMSTATE_HIT } from "./constants.ts";
-import { attackerStateUpdate, attackStartPacket, attackStopPacket, monsterMovePacket, unitValuesUpdate, UNIT_FIELD_HEALTH } from "./packets.ts";
+import { attackerStateUpdate, attackStartPacket, attackStopPacket, unitValuesUpdate, UNIT_FIELD_HEALTH } from "./packets.ts";
 
 function readPacked(reader: ByteReader): bigint {
   const mask = reader.readU8();
@@ -54,32 +54,6 @@ describe("combat packets", () => {
     expect(readPacked(stop)).toBe(1n);
     expect(readPacked(stop)).toBe(0n);
     expect(stop.readU32()).toBe(1);
-  });
-
-  test("SMSG_MONSTER_MOVE with a single linear segment facing a target", () => {
-    const reader = new ByteReader(
-      monsterMovePacket({ guid: 5n, splineId: 9, from: { x: 1, y: 2, z: 3 }, to: { x: 4, y: 5, z: 6 }, durationMs: 1500, facingTarget: 7n }),
-    );
-    expect(readPacked(reader)).toBe(5n);
-    expect(reader.readU8()).toBe(0);
-    expect([reader.readF32(), reader.readF32(), reader.readF32()]).toEqual([1, 2, 3]);
-    expect(reader.readU32()).toBe(9);
-    expect(reader.readU8()).toBe(3);
-    expect(reader.readU64()).toBe(7n);
-    expect(reader.readU32()).toBe(0);
-    expect(reader.readU32()).toBe(1500);
-    expect(reader.readU32()).toBe(1);
-    expect([reader.readF32(), reader.readF32(), reader.readF32()]).toEqual([4, 5, 6]);
-    expect(reader.remaining).toBe(0);
-    const stop = new ByteReader(monsterMovePacket({ guid: 5n, splineId: 10, from: { x: 1, y: 2, z: 3 }, stop: true }));
-    readPacked(stop);
-    stop.readU8();
-    stop.readF32();
-    stop.readF32();
-    stop.readF32();
-    expect(stop.readU32()).toBe(10);
-    expect(stop.readU8()).toBe(1);
-    expect(stop.remaining).toBe(0);
   });
 
   test("unit values update carries only the listed fields", () => {

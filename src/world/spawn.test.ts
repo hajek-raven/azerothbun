@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import type { Socket } from "bun";
 import type { CreatureSpawn, CreatureTemplate, GameObjectSpawn, GameObjectTemplate, ItemTemplate, WorldData } from "../data/world.ts";
 import { WorldCrypt } from "../crypto/world-crypt.ts";
@@ -21,8 +21,13 @@ import {
   SMSG_UPDATE_OBJECT,
 } from "./packets.ts";
 import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
-import { creatureCreateBlock, creatureGuid, creatureQueryPayload, diffVisible, gameObjectCreateBlock, gameObjectQueryPayload, indexSpawns, itemQueryPayload, spawnUpdatePayloads } from "./spawn.ts";
+import { creatureCreateBlock, creatureGuid, creatureQueryPayload, gameObjectCreateBlock, gameObjectQueryPayload, itemQueryPayload } from "./spawn.ts";
 import { startWorldServer } from "./server.ts";
+import { WorldSession } from "./session.ts";
+import { advanceMaps, setUpTestMapWorld, tearDownTestMapWorld } from "./map-world.test-util.ts";
+import { addRows, creatureRow, gameObjectRow, loadSpawnFixture, worldSchema as w } from "../game/Maps/SpawnData.test-util.ts";
+import { sMapMgr } from "../game/Maps/MapMgr.ts";
+import type { MySqlTable } from "drizzle-orm/mysql-core";
 
 const START = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
 
@@ -77,48 +82,173 @@ test("query and create packets follow the 3.3.5 layout", () => {
   expect(chest[0]).toBe(2);
 });
 
-test("visibility matches continent range, phase, and normal spawn mask", () => {
-  const world = fakeWorld();
-  const index = indexSpawns(world);
-  const known = new Set<bigint>();
-  const first = diffVisible(index, world, START, known);
-  const guids = first.creates.map((block) => block[0]);
-  expect(first.creates).toHaveLength(2);
-  expect(guids).toEqual([2, 3]);
-  expect(first.gone).toEqual([]);
-  expect(diffVisible(index, world, START, known).creates).toEqual([]);
-
-  const left = diffVisible(index, world, { map: 0, x: START.x + 800, y: START.y, z: START.z }, known);
-  expect(left.creates).toEqual([]);
-  expect(left.gone).toHaveLength(2);
-  const payload = spawnUpdatePayloads([], left.gone)[0]!;
-  const reader = new ByteReader(payload);
-  expect(reader.readU32()).toBe(1);
-  expect(reader.readU8()).toBe(4);
-  expect(reader.readU32()).toBe(2);
+afterEach(() => {
+  tearDownTestMapWorld();
 });
+
+/**
+ * Marshal McBride spawned four times and a trap, in `creature` / `gameobject` rows the map layer loads:
+ * 1 next to the start, 2 four hundred yards away, 3 for the heroic spawn mode only, 4 in phase 2; the trap 10 yards away.
+ */
+function spawnWorld(): WorldData {
+  const rows = new Map<MySqlTable, Record<string, unknown>[]>();
+  addRows(rows, w.creature_template, { entry: 197, name: "Marshal McBride", subname: "Abbey", minlevel: 5, maxlevel: 5, faction: 12, npcflag: 2, unit_class: 1, type: 7, speed_walk: 1, speed_run: 1.14286 });
+  addRows(rows, w.creature_template_model, { CreatureID: 197, Idx: 0, CreatureDisplayID: 1859, DisplayScale: 1, Probability: 1 });
+  addRows(
+    rows,
+    w.creature,
+    creatureRow(1, 197, 0, START.x, START.y),
+    creatureRow(2, 197, 0, START.x + 400, START.y),
+    creatureRow(3, 197, 0, START.x, START.y, { spawnMask: 2 }),
+    creatureRow(4, 197, 0, START.x, START.y, { phaseMask: 2 }),
+  );
+  addRows(rows, w.gameobject_template, { entry: 50, type: 6, displayId: 100, name: "Trap", size: 1 });
+  addRows(rows, w.gameobject, gameObjectRow(8, 50, 0, START.x + 10, START.y));
+  const { world } = loadSpawnFixture(rows);
+  setUpTestMapWorld(world);
+  return world;
+}
+
+/** The blocks of the `SMSG_UPDATE_OBJECT` packets in a list of encoded packets, and the out of range guids they carry. */
+function updateBlocks(packets: Uint8Array[]): { creates: number; gone: number } {
+  let creates = 0;
+  let gone = 0;
+  for (const packet of packets) {
+    if ((packet[2]! | (packet[3]! << 8)) !== SMSG_UPDATE_OBJECT) continue;
+    const reader = new ByteReader(packet.slice(4));
+    const count = reader.readU32();
+    // the creature and gameobject create blocks start with the update type
+    const type = reader.readU8();
+    if (type === 4) gone += reader.readU32();
+    else creates += count;
+  }
+  return { creates, gone };
+}
+
+test("a player sees what is within the visibility range, in its phase, in the spawn mode of the map", async () => {
+  const world = spawnWorld();
+  const sessionKey = crypto.getRandomValues(new Uint8Array(40));
+  const db = await seededTestDatabases(world.tables());
+  await saveSessionKey(db.login, "TEST", sessionKey);
+  const session = new WorldSession(db, world);
+  const delivered: Uint8Array[] = [];
+  session.attach((packet) => delivered.push(packet));
+  const clientSeed = Uint8Array.from([1, 2, 3, 4]);
+  const digest = sessionDigest("TEST", clientSeed, authSeed(session.greeting), sessionKey);
+  await session.handle(CMSG_AUTH_SESSION, authSession("TEST", clientSeed, digest));
+  const entered = await session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array());
+
+  // creature 1 and the trap: the one within 100 yards, in phase 1, in the normal spawn mode (3, 4, and 2 are not)
+  const visible = session.mapPlayer!.getObjectVisibilityContainer().getVisibleWorldObjectsMap()!;
+  expect([...visible.keys()].sort()).toEqual([creatureGuid(197, 1), gameObjectGuidOf(50, 8)].sort());
+  // after the self block of the burst the update that creates them
+  // (the login burst has the player's own block, then the trap and the creature)
+  expect(updateBlocks(entered.packets).creates).toBe(3);
+  // the grids hold the spawns of the normal mode of the map; the creature in another phase is loaded but not seen
+  const map = sMapMgr().findBaseMap(0)!;
+  expect(map.getCreatureBySpawnIdStore().get(3)).toBeUndefined();
+  expect(map.getCreatureBySpawnIdStore().get(4)).toHaveLength(1);
+  expect(map.getCreatureBySpawnIdStore().get(2)).toHaveLength(1);
+  expect(session.mapPlayer!.haveAtClient(creatureGuid(197, 4))).toBe(false);
+
+  // walk 800 yards away: after the visibility delay they are destroyed
+  delivered.length = 0;
+  await session.handle(0x0ee, movement(1n, START.x + 800, START.y, START.z));
+  expect(delivered).toHaveLength(0); // nothing yet: `AddToNotify` delays the update
+  advanceMaps(500);
+  expect(updateBlocks(delivered).gone).toBe(2);
+  expect(visible.size).toBe(0);
+
+  // and back: they are created again
+  delivered.length = 0;
+  await session.handle(0x0ee, movement(1n, START.x, START.y, START.z));
+  advanceMaps(500);
+  expect(updateBlocks(delivered).creates).toBe(2);
+  expect(visible.has(creatureGuid(197, 1))).toBe(true);
+  await session.disconnect();
+});
+
+test("a creature flagged far visible is seen from beyond the normal range", async () => {
+  const rows = new Map<MySqlTable, Record<string, unknown>[]>();
+  for (const entry of [197, 198]) {
+    addRows(rows, w.creature_template, { entry, name: `creature ${entry}`, minlevel: 5, maxlevel: 5, faction: 12, unit_class: 1, speed_walk: 1, speed_run: 1 });
+    addRows(rows, w.creature_template_model, { CreatureID: entry, Idx: 0, CreatureDisplayID: 1000 + entry, DisplayScale: 1, Probability: 1 });
+  }
+  // 150 yards away: past the 100 yards of a normal creature, within the 200 of a "large" one
+  addRows(rows, w.creature, creatureRow(1, 197, 0, START.x + 150, START.y), creatureRow(2, 198, 0, START.x + 150, START.y));
+  addRows(rows, w.creature_template_addon, { entry: 198, path_id: 0, mount: 0, bytes1: 0, bytes2: 0, emote: 0, visibilityDistanceType: 3, auras: null });
+  const { world } = loadSpawnFixture(rows);
+  setUpTestMapWorld(world);
+  const sessionKey = crypto.getRandomValues(new Uint8Array(40));
+  const db = await seededTestDatabases(world.tables());
+  await saveSessionKey(db.login, "TEST", sessionKey);
+  const session = new WorldSession(db, world);
+  const clientSeed = Uint8Array.from([1, 2, 3, 4]);
+  await session.handle(CMSG_AUTH_SESSION, authSession("TEST", clientSeed, sessionDigest("TEST", clientSeed, authSeed(session.greeting), sessionKey)));
+  await session.handle(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array());
+  const visible = session.mapPlayer!.getObjectVisibilityContainer().getVisibleWorldObjectsMap()!;
+  expect([...visible.keys()]).toEqual([creatureGuid(198, 2)]);
+  await session.disconnect();
+});
+
+function gameObjectGuidOf(entry: number, spawnId: number): bigint {
+  return BigInt(spawnId) | (BigInt(entry) << 24n) | (0xf110n << 48n);
+}
+
+function authSession(username: string, clientSeed: Uint8Array, digest: Uint8Array): Uint8Array {
+  return new ByteWriter()
+    .writeU32(12340)
+    .writeU32(0)
+    .writeCString(username)
+    .writeU32(0)
+    .writeBytes(clientSeed)
+    .writeU32(0)
+    .writeU32(0)
+    .writeU32(1)
+    .writeU32(0)
+    .writeU32(0)
+    .writeBytes(digest)
+    .writeU32(0)
+    .toUint8Array();
+}
+
+function movement(guid: bigint, x: number, y: number, z: number): Uint8Array {
+  return new ByteWriter()
+    .writeU8(0x01)
+    .writeU8(Number(guid & 0xffn))
+    .writeU32(0)
+    .writeU16(0)
+    .writeU32(1)
+    .writeF32(x)
+    .writeF32(y)
+    .writeF32(z)
+    .writeF32(0)
+    .writeU32(0)
+    .toUint8Array();
+}
 
 test("login sends the creatures standing next to the character", async () => {
   const sessionKey = new Uint8Array(40);
   crypto.getRandomValues(sessionKey);
   const db = await seededTestDatabases();
   await saveSessionKey(db.login, "TEST", sessionKey);
-  const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db, world: fakeWorld() });
+  const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db, world: spawnWorld() });
   const client = await connect(server.port ?? 0);
   const crypt = await login(client, sessionKey);
 
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array(), crypt));
+  // the burst (17 packets), then what the player sees: the trap (`UpdateVisibilityForPlayer`) and the creature (the relocation
+  // notifier), and `Player::UpdateZone`'s world states
   let spawn: Uint8Array | null = null;
-  for (let index = 0; index < 17; index++) {
+  for (let index = 0; index < 19; index++) {
     const packet = await readServerPacket(client, crypt);
-    if (index === 16) {
-      spawn = packet.payload;
-      expect(packet.opcode).toBe(SMSG_UPDATE_OBJECT);
-    }
+    if (index === 18) spawn = packet.payload;
+    if (index >= 17) expect(packet.opcode).toBe(SMSG_UPDATE_OBJECT);
   }
   expect(spawn).not.toBeNull();
-  expect(new ByteReader(spawn!).readU32()).toBe(2);
+  expect(new ByteReader(spawn!).readU32()).toBe(1);
   expect(containsU32(spawn!, 1859)).toBe(true);
+  expect((await readServerPacket(client, crypt)).opcode).toBe(0x2c2);
 
   client.send(encodeClientPacket(CMSG_CREATURE_QUERY, new ByteWriter().writeU32(197).writeU64(creatureGuid(197, 1)).toUint8Array(), crypt));
   const query = await readServerPacket(client, crypt);
@@ -128,7 +258,8 @@ test("login sends the creatures standing next to the character", async () => {
   client.send(encodeClientPacket(CMSG_ITEM_QUERY_SINGLE, new ByteWriter().writeU32(1899).toUint8Array(), crypt));
   const item = await readServerPacket(client, crypt);
   expect(item.opcode).toBe(SMSG_ITEM_QUERY_SINGLE_RESPONSE);
-  expect(new TextDecoder().decode(item.payload)).toContain("Monster - Sword, Long Basic");
+  // the world of this test has no item 1899: the "not found" form of the answer
+  expect(new ByteReader(item.payload).readU32()).toBe((1899 | 0x80000000) >>> 0);
 
   client.close();
   server.stop(true);

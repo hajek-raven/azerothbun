@@ -47,7 +47,6 @@ const TYPEID_UNIT = 3;
 const TYPEID_GAMEOBJECT = 5;
 const UPDATETYPE_CREATE_OBJECT = 2;
 const UPDATETYPE_CREATE_OBJECT2 = 3;
-const UPDATETYPE_OUT_OF_RANGE_OBJECTS = 4;
 const UPDATEFLAG_LOWGUID = 0x0010;
 const UPDATEFLAG_LIVING = 0x0020;
 const UPDATEFLAG_STATIONARY_POSITION = 0x0040;
@@ -56,14 +55,7 @@ const UPDATEFLAG_ROTATION = 0x0200;
 const SHEATH_STATE_MELEE = 1;
 const HIGHGUID_GAMEOBJECT = 0xf110n;
 const HIGHGUID_UNIT = 0xf130n;
-const PHASEMASK_NORMAL = 1;
-const SPAWNMASK_CONTINENT = 1;
-const CELL_SIZE = 533.33333 / 8;
-const CONTINENT_DISTANCE = 100;
-const INSTANCE_DISTANCE = 170;
-const MAX_UPDATE_PAYLOAD = 24_000;
 const CREATE_OBJECT2_TYPES = new Set([6, 16, 24, 26]);
-const CONTINENTS = new Set([0, 1, 530, 571]);
 
 const BASE_WALK = 2.5;
 const BASE_RUN = 7;
@@ -75,45 +67,12 @@ const BASE_FLIGHT_BACK = 4.5;
 const BASE_TURN = 3.141594;
 const BASE_PITCH = 3.14;
 
-type CellBucket = { creatures: CreatureSpawn[]; gameObjects: GameObjectSpawn[] };
-
-export type SpawnIndex = {
-  cells: Map<string, CellBucket>;
-};
-
-type Place = { map: number; x: number; y: number; z: number };
-
 export function creatureGuid(entry: number, counter: number): bigint {
   return BigInt(counter) | (BigInt(entry) << 24n) | (HIGHGUID_UNIT << 48n);
 }
 
 export function gameObjectGuid(entry: number, counter: number): bigint {
   return BigInt(counter) | (BigInt(entry) << 24n) | (HIGHGUID_GAMEOBJECT << 48n);
-}
-
-export function visibilityDistance(map: number): number {
-  return CONTINENTS.has(map) ? CONTINENT_DISTANCE : INSTANCE_DISTANCE;
-}
-
-export function indexSpawns(world: WorldData): SpawnIndex {
-  const cells = new Map<string, CellBucket>();
-  const bucket = (map: number, x: number, y: number): CellBucket => {
-    const key = `${map}:${cellOf(x)}:${cellOf(y)}`;
-    const found = cells.get(key);
-    if (found) {
-      return found;
-    }
-    const created: CellBucket = { creatures: [], gameObjects: [] };
-    cells.set(key, created);
-    return created;
-  };
-  for (const spawn of world.creaturesOnMap) {
-    bucket(spawn.map, spawn.x, spawn.y).creatures.push(spawn);
-  }
-  for (const spawn of world.gameObjectsOnMap) {
-    bucket(spawn.map, spawn.x, spawn.y).gameObjects.push(spawn);
-  }
-  return { cells };
 }
 
 /** Runtime overrides for a creature's create block (health, position, flags). `hidden` removes it from view. */
@@ -128,89 +87,9 @@ export type LiveCreatureView = {
   dynamicFlags: number;
   npcFlags: number;
   target: bigint;
+  /** Fields a command set on the creature (`SetDisplayId`, `SetFaction`, …), written over the template values. */
+  fields?: readonly { index: number; value: number }[];
 };
-
-export function diffVisible(
-  index: SpawnIndex,
-  world: WorldData,
-  place: Place,
-  known: Set<bigint>,
-  live?: (spawnGuid: number) => LiveCreatureView | null,
-): { creates: Uint8Array[]; gone: bigint[] } {
-  const now = new Set<bigint>();
-  const creates: Uint8Array[] = [];
-  for (const spawn of nearbyCreatures(index, place)) {
-    const template = world.creatureTemplate(spawn.entry);
-    if (!template || creatureModel(template).displayId <= 0) {
-      continue;
-    }
-    const view = live?.(spawn.guid) ?? null;
-    if (view?.hidden) {
-      continue;
-    }
-    const guid = creatureGuid(spawn.entry, spawn.guid);
-    now.add(guid);
-    if (!known.has(guid)) {
-      creates.push(creatureCreateBlock(spawn, template, world, view));
-      known.add(guid);
-    }
-  }
-  for (const spawn of nearbyGameObjects(index, place)) {
-    const template = world.gameObjectTemplate(spawn.entry);
-    if (!template || template.displayId <= 0) {
-      continue;
-    }
-    const guid = gameObjectGuid(spawn.entry, spawn.guid);
-    now.add(guid);
-    if (!known.has(guid)) {
-      creates.push(gameObjectCreateBlock(spawn, template));
-      known.add(guid);
-    }
-  }
-  const gone: bigint[] = [];
-  for (const guid of known) {
-    if (!now.has(guid)) {
-      gone.push(guid);
-      known.delete(guid);
-    }
-  }
-  return { creates, gone };
-}
-
-export function spawnUpdatePayloads(creates: Uint8Array[], gone: bigint[]): Uint8Array[] {
-  const blocks: Uint8Array[] = [];
-  if (gone.length > 0) {
-    blocks.push(outOfRangeBlock(gone));
-  }
-  blocks.push(...creates);
-  if (blocks.length === 0) {
-    return [];
-  }
-  const packets: Uint8Array[] = [];
-  let batch: Uint8Array[] = [];
-  let size = 4;
-  const flush = (): void => {
-    if (batch.length === 0) {
-      return;
-    }
-    const body = new ByteWriter().writeU32(batch.length);
-    for (const block of batch) {
-      body.writeBytes(block);
-    }
-    packets.push(body.toUint8Array());
-    batch = [];
-    size = 4;
-  };
-  for (const block of blocks) {
-    if (size + block.length > MAX_UPDATE_PAYLOAD && batch.length > 0) {
-      flush();
-    }
-    batch.push(block);
-    size += block.length;
-  }
-  flush();
-  return packets;
-}
 
 export function creatureQueryPayload(world: WorldData, entry: number): Uint8Array {
   const template = world.creatureTemplate(entry);
@@ -354,11 +233,20 @@ export function itemQueryPayload(world: WorldData, entry: number): Uint8Array {
     .toUint8Array();
 }
 
+/**
+ * The map object of a creature as the create block reads it: its movement block (`Object::BuildMovementUpdate`: movement flags, position,
+ * speeds, and the spline while it moves).
+ */
+export interface CreatureMovementSource {
+  buildMovementUpdate(data: ByteWriter): void;
+}
+
 export function creatureCreateBlock(
   spawn: CreatureSpawn,
   template: CreatureTemplate,
   world?: WorldData,
   live: LiveCreatureView | null = null,
+  movement: CreatureMovementSource | null = null,
 ): Uint8Array {
   const model = creatureModel(template);
   const stored = template.models.find((row) => row.displayId === model.displayId);
@@ -424,22 +312,31 @@ export function creatureCreateBlock(
   values[UNIT_NPC_FLAGS] = live ? live.npcFlags : flags.npcFlags;
   values[UNIT_FIELD_BYTES_2] = SHEATH_STATE_MELEE;
   setFloat(values, UNIT_FIELD_HOVERHEIGHT, template.hoverHeight > 0 ? template.hoverHeight : 1);
+  for (const field of live?.fields ?? []) {
+    if (field.index >= 0 && field.index < values.length) values[field.index] = field.value >>> 0;
+  }
 
   const body = new ByteWriter()
     .writeU8(UPDATETYPE_CREATE_OBJECT)
     .writeBytes(packedGuid(guid))
     .writeU8(TYPEID_UNIT)
-    .writeU16(UPDATEFLAG_LIVING | UPDATEFLAG_STATIONARY_POSITION)
-    .writeU32(0)
-    .writeU16(0)
-    .writeU32(Date.now())
-    .writeF32(live ? live.x : spawn.x)
-    .writeF32(live ? live.y : spawn.y)
-    .writeF32(live ? live.z : spawn.z)
-    .writeF32(live ? live.o : spawn.orientation)
-    .writeU32(0);
-  for (const speed of creatureSpeeds(template)) {
-    body.writeF32(speed);
+    .writeU16(UPDATEFLAG_LIVING | UPDATEFLAG_STATIONARY_POSITION);
+  if (movement) {
+    // the creature of the map: its own flags, position, speeds, and current spline
+    movement.buildMovementUpdate(body);
+  } else {
+    body
+      .writeU32(0)
+      .writeU16(0)
+      .writeU32(Date.now())
+      .writeF32(live ? live.x : spawn.x)
+      .writeF32(live ? live.y : spawn.y)
+      .writeF32(live ? live.z : spawn.z)
+      .writeF32(live ? live.o : spawn.orientation)
+      .writeU32(0);
+    for (const speed of creatureSpeeds(template)) {
+      body.writeF32(speed);
+    }
   }
   // Dynamic and npc flags stay in the mask even at 0. The client only applies a later
   // lootable / gossip change for a field that was present on the create.
@@ -477,74 +374,6 @@ export function gameObjectCreateBlock(spawn: GameObjectSpawn, template: GameObje
     .writeU32(spawn.guid)
     .writeU64(packedWorldRotation(rotation));
   writeValues(body, values);
-  return body.toUint8Array();
-}
-
-/** Creature spawns within `radius` of a point on the same map (spawn-row positions). */
-export function creaturesNear(index: SpawnIndex, place: Place, radius: number): CreatureSpawn[] {
-  const span = Math.ceil(radius / CELL_SIZE);
-  const cx = cellOf(place.x);
-  const cy = cellOf(place.y);
-  const found: CreatureSpawn[] = [];
-  for (let dx = -span; dx <= span; dx++) {
-    for (let dy = -span; dy <= span; dy++) {
-      const bucket = index.cells.get(`${place.map}:${cx + dx}:${cy + dy}`);
-      if (!bucket) {
-        continue;
-      }
-      for (const spawn of bucket.creatures) {
-        const ddx = spawn.x - place.x;
-        const ddy = spawn.y - place.y;
-        const ddz = spawn.z - place.z;
-        if (ddx * ddx + ddy * ddy + ddz * ddz <= radius * radius) {
-          found.push(spawn);
-        }
-      }
-    }
-  }
-  return found;
-}
-
-function nearbyCreatures(index: SpawnIndex, place: Place): CreatureSpawn[] {
-  return nearby(index, place).flatMap((bucket) => bucket.creatures).filter((spawn) => inRange(spawn, place));
-}
-
-function nearbyGameObjects(index: SpawnIndex, place: Place): GameObjectSpawn[] {
-  return nearby(index, place).flatMap((bucket) => bucket.gameObjects).filter((spawn) => inRange(spawn, place));
-}
-
-function nearby(index: SpawnIndex, place: Place): CellBucket[] {
-  const span = Math.ceil(visibilityDistance(place.map) / CELL_SIZE);
-  const cx = cellOf(place.x);
-  const cy = cellOf(place.y);
-  const buckets: CellBucket[] = [];
-  for (let dx = -span; dx <= span; dx++) {
-    for (let dy = -span; dy <= span; dy++) {
-      const bucket = index.cells.get(`${place.map}:${cx + dx}:${cy + dy}`);
-      if (bucket) {
-        buckets.push(bucket);
-      }
-    }
-  }
-  return buckets;
-}
-
-function inRange(spawn: { map: number; x: number; y: number; z: number; spawnMask: number; phaseMask: number }, place: Place): boolean {
-  if (spawn.map !== place.map || (spawn.spawnMask & SPAWNMASK_CONTINENT) === 0 || (spawn.phaseMask & PHASEMASK_NORMAL) === 0) {
-    return false;
-  }
-  const range = visibilityDistance(place.map);
-  const dx = spawn.x - place.x;
-  const dy = spawn.y - place.y;
-  const dz = spawn.z - place.z;
-  return dx * dx + dy * dy + dz * dz <= range * range;
-}
-
-function outOfRangeBlock(guids: bigint[]): Uint8Array {
-  const body = new ByteWriter().writeU8(UPDATETYPE_OUT_OF_RANGE_OBJECTS).writeU32(guids.length);
-  for (const guid of guids) {
-    body.writeBytes(packedGuid(guid));
-  }
   return body.toUint8Array();
 }
 
@@ -614,10 +443,6 @@ function powerForClass(classId: number): number {
     return 6;
   }
   return 0;
-}
-
-function cellOf(value: number): number {
-  return Math.floor(value / CELL_SIZE);
 }
 
 function setGuid(values: Uint32Array, guid: bigint): void {

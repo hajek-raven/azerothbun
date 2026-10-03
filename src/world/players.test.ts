@@ -22,10 +22,12 @@ import {
 } from "./packets.ts";
 import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
 import { startWorldServer } from "./server.ts";
+import { advanceMaps, setUpTestMaps, tearDownTestMapWorld } from "./map-world.test-util.ts";
 
 const HEARTBEAT = 0x0ee;
 
 test("nearby players are created, moved, and destroyed", async () => {
+  setUpTestMaps();
   const db = await seededTestDatabases();
   const server = startWorldServer({ hostname: "127.0.0.1", port: 0, db });
   const port = server.port ?? 0;
@@ -55,11 +57,16 @@ test("nearby players are created, moved, and destroyed", async () => {
   second.client.send(encodeClientPacket(HEARTBEAT, movement(2n, movedX + 800, -136, 83.5312), second.crypt));
   const leaving = await readServerPacket(first.client, first.crypt);
   expect(leaving.opcode).toBe(HEARTBEAT);
+  // the visibility update follows after the visibility delay of the map (`Map::Update`): the player is destroyed for the other
+  advanceMaps(500);
   const gone = await readServerPacket(first.client, first.crypt);
-  expect(gone.opcode).toBe(SMSG_UPDATE_OBJECT);
-  expect(gone.payload[4]).toBe(4);
+  expect(gone.opcode).toBe(SMSG_DESTROY_OBJECT);
+  expect(new ByteReader(gone.payload).readU64()).toBe(2n);
 
   second.client.send(encodeClientPacket(HEARTBEAT, movement(2n, movedX, -136, 83.5312), second.crypt));
+  // back in range: created again once the delay has passed (the heartbeat itself reaches nobody while they do not see it)
+  await Bun.sleep(100);
+  advanceMaps(500);
   const back = await readServerPacket(first.client, first.crypt);
   expect(back.opcode).toBe(SMSG_UPDATE_OBJECT);
   expect(back.payload[4]).toBe(3);
@@ -75,6 +82,7 @@ test("nearby players are created, moved, and destroyed", async () => {
   first.client.close();
   second.client.close();
   server.stop(true);
+  tearDownTestMapWorld();
 });
 
 async function enter(
@@ -124,10 +132,11 @@ async function enter(
   expect(character).toBeDefined();
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(BigInt(character!.guid)).toUint8Array(), crypt));
   let other: Uint8Array | null = null;
-  const count = otherAlreadyIn ? 17 : 16;
+  // the login burst and the message of the day (17), the other player's create block, and `Player::UpdateZone`'s world states
+  const count = otherAlreadyIn ? 19 : 18;
   for (let index = 0; index < count; index++) {
     const packet = await readServerPacket(client, crypt);
-    if (index === 16) {
+    if (otherAlreadyIn && index === 17) {
       expect(packet.opcode).toBe(SMSG_UPDATE_OBJECT);
       other = packet.payload;
     }

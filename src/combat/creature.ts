@@ -51,6 +51,9 @@ export type CreatureInfo = {
   factionTemplate: number;
   combatReach: number;
   boundingRadius: number;
+  /** The display and scale `Unit::GetCollisionHeight` reads (`creature_template_model`). */
+  displayId?: number;
+  scale?: number;
   runSpeed: number;
   rank: number;
   type: number;
@@ -167,6 +170,8 @@ export class CreatureInfoStore {
       factionTemplate: template.faction,
       combatReach: (stored?.combatReach ?? 0) * scale,
       boundingRadius: (stored?.boundingRadius ?? 0) * scale,
+      displayId: model.displayId,
+      scale,
       runSpeed: BASE_RUN * (template.speedRun > 0 ? template.speedRun : 1),
       rank: template.rank,
       type: template.type,

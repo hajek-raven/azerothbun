@@ -1,5 +1,5 @@
 import { testDatabase } from "../database/test-db.ts";
-import { objectGuids } from "../game/globals/object-guids.ts";
+import { objectGuids } from "../game/Globals/object-guids.ts";
 import { characters, item_instance } from "../database/schema/characters.ts";
 import { describe, expect, test } from "bun:test";
 import {

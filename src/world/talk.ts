@@ -203,7 +203,7 @@ export class Talk {
     payload: Uint8Array,
     player: Character,
     kit: CharacterLoginKit,
-    known: ReadonlySet<bigint>,
+    known: Iterable<bigint>,
   ): TalkPacket[] | null {
     this.syncSpeaker(player);
     switch (opcode) {
@@ -480,7 +480,7 @@ export class Talk {
     return [packet(SMSG_QUESTGIVER_STATUS, "SMSG_QUESTGIVER_STATUS", buildQuestGiverStatus(guid, status))];
   }
 
-  private statusMultiple(known: ReadonlySet<bigint>): TalkPacket[] {
+  private statusMultiple(known: Iterable<bigint>): TalkPacket[] {
     const entries: { guid: bigint; status: number }[] = [];
     for (const guid of known) {
       const target = this.resolve(guid);
@@ -789,6 +789,37 @@ export class Talk {
         ),
       );
     }
+    return packets;
+  }
+
+  /** The quest log and money fields after a command changed the log (`.quest add|remove|complete`). */
+  questLogUpdate(player: Character): TalkPacket {
+    return this.progress(player, true);
+  }
+
+  /**
+   * @ac game/Entities/Player/PlayerQuest.cpp Player::RewardQuest (`.quest reward`: reward choice 0, no quest giver)
+   * Item rewards wait for the bag storage the quest giver path does not use either.
+   */
+  rewardByCommand(player: Character, kit: CharacterLoginKit, questId: number): TalkPacket[] | null {
+    this.syncSpeaker(player);
+    const reward = this.quests.reward(questId, 0, player.level);
+    if (!reward) return null;
+    const xpPackets = this.giveXp ? this.giveXp(reward.xp) : [];
+    if (!this.giveXp) applyXp(player, reward.xp, worldDatabase(this.world));
+    player.money = Math.max(0, player.money + reward.money);
+    if (reward.spell > 0 && !kit.spells.includes(reward.spell)) kit.spells.push(reward.spell);
+    for (const faction of reward.factions) {
+      const slot = kit.factions.find((row) => row.faction === faction.faction);
+      if (slot) slot.standing += faction.standing;
+      else kit.factions.push({ faction: faction.faction, standing: faction.standing, flags: 0 });
+    }
+    const packets = [
+      ...xpPackets,
+      packet(SMSG_QUESTGIVER_QUEST_COMPLETE, "SMSG_QUESTGIVER_QUEST_COMPLETE", buildQuestGiverQuestComplete({ ...reward, questId })),
+      this.progress(player, true),
+    ];
+    if (reward.spell > 0) packets.push(packet(SMSG_LEARNED_SPELL, "SMSG_LEARNED_SPELL", new ByteWriter().writeU32(reward.spell).writeU16(0).toUint8Array()));
     return packets;
   }
 

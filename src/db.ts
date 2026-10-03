@@ -5,7 +5,7 @@ import type { Db } from "./database/database.ts";
 import { account, realmlist } from "./database/schema/auth.ts";
 import { character_inventory, characters } from "./database/schema/characters.ts";
 import type { WorldTables } from "./database/world-tables.ts";
-import { objectGuids } from "./game/globals/object-guids.ts";
+import { objectGuids } from "./game/Globals/object-guids.ts";
 import { createItem } from "./items/instance.ts";
 
 export const CLIENT_BUILD = 12340;

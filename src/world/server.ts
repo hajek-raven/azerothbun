@@ -19,52 +19,13 @@ import {
 } from "./packets.ts";
 import { QuestParty } from "./party.ts";
 import { PlayerView } from "./players.ts";
-import { indexSpawns, type SpawnIndex } from "./spawn.ts";
+import { mapCreatureLocator, type CreatureLocator } from "./map-world.ts";
 import { describeWorldOpcode, WorldSession, type SessionDatabases } from "./session.ts";
+import type { WorldSessionMgr } from "../game/Server/WorldSessionMgr.ts";
 import type { PlayerEnvironment } from "../characters/player-env.ts";
 
-/** `WorldSessionMgr::UpdateSessions` — every connected session gets the world tick. */
-export class WorldSessions {
-  private readonly sessions = new Set<WorldSession>();
-
-  add(session: WorldSession): void {
-    this.sessions.add(session);
-  }
-
-  delete(session: WorldSession): void {
-    this.sessions.delete(session);
-  }
-
-  get size(): number {
-    return this.sessions.size;
-  }
-
-  private readonly logouts = new Set<Promise<void>>();
-
-  /** A closed socket's `LogoutPlayer` save; `drain` waits for it. */
-  trackLogout(logout: Promise<void>): void {
-    this.logouts.add(logout);
-    void logout.finally(() => this.logouts.delete(logout));
-  }
-
-  /** Waits for every logout save started so far (shutdown, before the pools close). */
-  async drain(): Promise<void> {
-    while (this.logouts.size > 0) {
-      await Promise.all([...this.logouts]);
-    }
-  }
-
-  update(diff: number): void {
-    for (const session of this.sessions) {
-      try {
-        session.update(diff);
-      } catch (error) {
-        const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
-        log("world", `WorldSession::Update failed: ${message}`);
-      }
-    }
-  }
-}
+/** `WorldSessionMgr` lives in `src/game/Server/WorldSessionMgr.ts`; the old name stays for callers. */
+export { WorldSessionMgr as WorldSessions } from "../game/Server/WorldSessionMgr.ts";
 import { talkDataFor } from "./talk.ts";
 
 export type WorldSocketData = {
@@ -117,9 +78,9 @@ export function startWorldServer(options: {
   /** Stat, skill, and regen tables shared by every player. */
   playerEnv?: PlayerEnvironment;
   /** Receives each session so the world tick can update it. */
-  sessions?: WorldSessions;
+  sessions?: WorldSessionMgr;
 }): TCPSocketListener<WorldSocketData> {
-  const spawns: SpawnIndex | null = options.world ? indexSpawns(options.world) : null;
+  const spawns: CreatureLocator | null = options.world ? mapCreatureLocator : null;
   if (options.world) {
     const talk = talkDataFor(options.world);
     log("world", `loaded ${talk.quests.quests.size} quests`);
@@ -148,6 +109,8 @@ export function startWorldServer(options: {
         );
         // `WorldSocket::SendPacket`: every packet reaches the socket, and its header cipher, in the order it is sent.
         session.attach((packet) => io.send(sealServerPacket(packet, session.crypt)));
+        session.attachClose(() => io.close());
+        session.remoteAddress = socket.remoteAddress;
         options.sessions?.add(session);
         socket.data = { session, io, header: null, pumping: Promise.resolve() };
         log("world", `connection from ${socket.remoteAddress}`);

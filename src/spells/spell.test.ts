@@ -5,6 +5,7 @@ import { MSG_CHANNEL_START, SMSG_AURA_UPDATE, SMSG_CAST_FAILED, SMSG_PERIODICAUR
 import { SpellStore } from "./spell-info.ts";
 import { unsupportedReason } from "./spell.ts";
 import { TestMap, TestUnit } from "./test-units.ts";
+import { LineOfSightHooks } from "../game/Maps/MapLineOfSight.ts";
 
 const hasDbc = await Bun.file("data/dbc/Spell.dbc").exists();
 const spells = hasDbc ? await SpellStore.load("data/dbc", null) : null;
@@ -171,4 +172,50 @@ test.skipIf(!hasDbc)("killing the target with a direct hit removes its auras", (
   map.advance(1000);
   expect(enemy.isAlive()).toBe(false);
   expect(enemy.appliedAuras.length).toBe(0);
+});
+
+test.skipIf(!hasDbc)("a spell needs line of sight to its target, except one that ignores it or a spell on the caster", () => {
+  const { map, caster, enemy } = setup();
+  const saved = LineOfSightHooks.findMap;
+  const info = spells!.get(133)!;
+  const attributes = info.attributes[2]!;
+  const asked: number[][] = [];
+  LineOfSightHooks.findMap = () => ({
+    isInLineOfSight(x1, _y1, _z1, x2, _y2, _z2, _phase, checks) {
+      asked.push([x1, x2, checks]);
+      return false;
+    },
+  });
+  try {
+    expect(caster.castSpell(enemy, 133)).toBe(D.SPELL_FAILED_LINE_OF_SIGHT);
+    expect(caster.opcodes()).toContain(SMSG_CAST_FAILED);
+    // from the caster's eye to the creature's hit sphere toward the caster (x 0 -> 10 - combat reach 1.5), with every check
+    expect(asked[0]![0]).toBeCloseTo(0, 3);
+    expect(asked[0]![1]).toBeCloseTo(8.5, 3);
+    expect(asked[0]![2]).toBe(7);
+
+    // a spell on the caster is not checked
+    asked.length = 0;
+    expect(caster.castSpell(caster, 139, { castCount: 2 })).toBe(D.SPELL_CAST_OK);
+    expect(asked).toHaveLength(0);
+    map.advance(1500);
+
+    // SPELL_ATTR2_IGNORE_LINE_OF_SIGHT (also set by a `disables` row)
+    info.attributes[2] = (attributes | D.SPELL_ATTR2_IGNORE_LINE_OF_SIGHT) >>> 0;
+    expect(caster.castSpell(enemy, 133, { castCount: 3 })).toBe(D.SPELL_CAST_OK);
+  } finally {
+    info.attributes[2] = attributes;
+    LineOfSightHooks.findMap = saved;
+  }
+});
+
+test.skipIf(!hasDbc)("a spell with line of sight to its target casts", () => {
+  const { caster, enemy } = setup();
+  const saved = LineOfSightHooks.findMap;
+  LineOfSightHooks.findMap = () => ({ isInLineOfSight: () => true });
+  try {
+    expect(caster.castSpell(enemy, 133)).toBe(D.SPELL_CAST_OK);
+  } finally {
+    LineOfSightHooks.findMap = saved;
+  }
 });

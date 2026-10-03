@@ -1,3 +1,4 @@
+import * as UF from "../gen/UpdateFields.gen.ts";
 import {
   GT_MAX_LEVEL,
   GT_MAX_RATING,
@@ -96,6 +97,16 @@ export const PUBLIC_STAT_FIELDS: ReadonlySet<number> = new Set([
   UNIT_FIELD_BASEATTACKTIME + 1,
   UNIT_MOD_CAST_SPEED,
   UNIT_FIELD_BASE_MANA,
+  // `InitDisplayIds`, `SetFaction`, `SetObjectScale`, and `PLAYER_FLAGS` (set at login and by the chat commands).
+  UF.OBJECT_FIELD_SCALE_X,
+  UF.UNIT_FIELD_FACTIONTEMPLATE,
+  UF.UNIT_FIELD_COMBATREACH,
+  UF.UNIT_FIELD_DISPLAYID,
+  UF.UNIT_FIELD_NATIVEDISPLAYID,
+  UF.UNIT_FIELD_MOUNTDISPLAYID,
+  UF.UNIT_NPC_EMOTESTATE,
+  UF.PLAYER_FLAGS,
+  UF.PLAYER_CHOSEN_TITLE,
 ]);
 
 export const STAT_STRENGTH = 0;

@@ -1,9 +1,11 @@
+import { SERVER_MSG_RESTART_CANCELLED, SERVER_MSG_RESTART_TIME, SERVER_MSG_SHUTDOWN_CANCELLED, SERVER_MSG_SHUTDOWN_TIME, sWorldSessionMgr } from "../Server/WorldSessionMgr.ts";
+import { ConfigMgr, ConfigSeverity, defaultConfigPolicy } from "../../common/config.ts";
 import { HOUR, IN_MILLISECONDS, MINUTE, SECOND } from "../../common/duration.ts";
 import { log } from "../../log.ts";
 import { getGameTime, getGameTimeMS, updateGameTimers } from "../time/game-time.ts";
 import { getMSTime, getMSTimeDiffU32, IntervalTimer, secsToTimeString } from "../time/timer.ts";
 import { worldUpdateTime, type WorldUpdateTime } from "../time/update-time.ts";
-import { ServerConfig, type WorldConfig } from "./world-config.ts";
+import { ServerConfig, WorldConfig } from "./world-config.ts";
 
 export const WorldTimer = {
   WUPDATE_UPTIME: 0,
@@ -36,7 +38,7 @@ export type ShutdownExitCode = (typeof ShutdownExitCode)[keyof typeof ShutdownEx
 
 /**
  * The world tick from `World::Update` for game time, shutdown, and the world timers.
- * Map, session, auction, and script updates join this method as those systems are ported.
+ * The map update (`sMapMgr->Update`) runs after the sessions; auction and script updates join this method as those systems are ported.
  */
 export class World {
   private readonly timers: IntervalTimer[];
@@ -49,10 +51,14 @@ export class World {
   private queuedSessions = 0;
   /** `WorldSessionMgr::UpdateSessions` — the world server registers its sessions here. */
   private sessionUpdate: ((diff: number) => void) | null = null;
+  /** `sMapMgr->Update(diff)`: the map system registers itself at startup (`MapMgr` imports this file for `sWorld()`). */
+  private mapUpdate: ((diff: number) => void) | null = null;
+  /** `World::_dataPath`: `DataDir` with a trailing slash, `maps/`, `vmaps/`, and `mmaps/` below it. */
+  private dataPath = "./";
   loopCounter = 0;
 
   constructor(
-    private readonly settings: WorldConfig,
+    readonly settings: WorldConfig,
     private readonly updateTime: WorldUpdateTime = worldUpdateTime,
   ) {
     this.timers = Array.from({ length: WorldTimer.WUPDATE_COUNT }, () => new IntervalTimer());
@@ -68,6 +74,103 @@ export class World {
     this.timers[WorldTimer.WUPDATE_PINGDB]?.setInterval(this.settings.getUInt(ServerConfig.CONFIG_DB_PING_INTERVAL) * MINUTE * IN_MILLISECONDS);
     this.timers[WorldTimer.WUPDATE_5_SECS]?.setInterval(5 * IN_MILLISECONDS);
     this.timers[WorldTimer.WUPDATE_WHO_LIST]?.setInterval(5 * IN_MILLISECONDS);
+  }
+
+  /** @ac game/World/World.h World::getBoolConfig */
+  getBoolConfig(id: ServerConfig): boolean {
+    return this.settings.getBool(id);
+  }
+
+  /** @ac game/World/World.h World::getIntConfig */
+  getIntConfig(id: ServerConfig): number {
+    return this.settings.getUInt(id);
+  }
+
+  /** @ac game/World/World.h World::getFloatConfig */
+  getFloatConfig(id: ServerConfig): number {
+    return this.settings.getFloat(id);
+  }
+
+  /** @ac game/World/World.h World::getRate */
+  getRate(id: ServerConfig): number {
+    return this.settings.getFloat(id);
+  }
+
+  /** @ac game/World/World.cpp World::IsPvPRealm (`REALM_TYPE_PVP`, `REALM_TYPE_RPPVP`, `REALM_TYPE_FFA_PVP`) */
+  isPvPRealm(): boolean {
+    const type = this.settings.getUInt(ServerConfig.CONFIG_GAME_TYPE);
+    return type === 1 || type === 8 || type === 16;
+  }
+
+  /** @ac game/World/World.cpp World::IsFFAPvPRealm (`REALM_TYPE_FFA_PVP`) */
+  isFFAPvPRealm(): boolean {
+    return this.settings.getUInt(ServerConfig.CONFIG_GAME_TYPE) === 16;
+  }
+
+  /** @ac game/World/World.h World::getStringConfig */
+  getStringConfig(id: ServerConfig): string {
+    return this.settings.getString(id);
+  }
+
+  /** @ac game/World/World.h World::setBoolConfig */
+  setBoolConfig(id: ServerConfig, value: boolean): void {
+    this.settings.overwrite(id, value);
+  }
+
+  /** @ac game/World/World.h World::setIntConfig */
+  setIntConfig(id: ServerConfig, value: number): void {
+    this.settings.overwrite(id, value);
+  }
+
+  private isClosedFlag = false;
+  private allowedSecurityLevel = 0;
+  /** `realmlist.name` of this realm. */
+  realmName = "";
+  /** `WorldSessionMgr::_maxActiveSessionCount` */
+  private maxActiveSessions = 0;
+
+  /** @ac game/World/World.cpp World::IsClosed */
+  isClosed(): boolean {
+    return this.isClosedFlag;
+  }
+
+  /** @ac game/World/World.cpp World::SetClosed */
+  setClosed(val: boolean): void {
+    this.isClosedFlag = val;
+  }
+
+  /** @ac game/World/World.h World::GetPlayerSecurityLimit */
+  getPlayerSecurityLimit(): number {
+    return this.allowedSecurityLevel;
+  }
+
+  /** @ac game/World/World.cpp World::SetPlayerSecurityLimit (raising it kicks the sessions below the new level) */
+  setPlayerSecurityLimit(security: number, kickAllLess?: (security: number) => void): void {
+    const sec = security < 4 /* SEC_CONSOLE */ ? security : 0;
+    const update = sec > this.allowedSecurityLevel;
+    this.allowedSecurityLevel = sec;
+    if (update) kickAllLess?.(sec);
+  }
+
+  /** @ac game/World/World.h World::GetShutDownTimeLeft */
+  getShutDownTimeLeft(): number {
+    return this.shutdownTimer;
+  }
+
+  getMaxActiveSessionCount(): number {
+    return Math.max(this.maxActiveSessions, this.activeSessions);
+  }
+
+  getShutdownReason(): string {
+    return this.shutdownReason;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shutdownTimer > 0;
+  }
+
+  getQueuedSessionCount(): number {
+    return this.queuedSessions;
   }
 
   isStopped(): boolean {
@@ -92,6 +195,7 @@ export class World {
 
   setSessionCounts(active: number, queued = 0): void {
     this.activeSessions = active;
+    this.maxActiveSessions = Math.max(this.maxActiveSessions, active);
     this.queuedSessions = queued;
   }
 
@@ -101,6 +205,40 @@ export class World {
 
   setSessionUpdate(update: ((diff: number) => void) | null): void {
     this.sessionUpdate = update;
+  }
+
+  /** @ac game/World/World.h World::GetDataPath */
+  getDataPath(): string {
+    return this.dataPath;
+  }
+
+  /**
+   * @ac game/World/World.cpp World::LoadConfigSettings (the `DataDir` part)
+   * An empty path or one without a trailing slash gets a `/`, a leading `~` is the home directory. A reload keeps the first
+   * value (`DataDir option can't be changed at worldserver.conf reload`); returns false when it was refused.
+   */
+  loadDataPath(configured: string, reload = false): boolean {
+    let dataPath = configured;
+    if (dataPath.length === 0 || (!dataPath.endsWith("/") && !dataPath.endsWith("\\"))) dataPath += "/";
+    if (dataPath.startsWith("~")) {
+      const home = process.env.HOME;
+      if (home) dataPath = home + dataPath.slice(1);
+    }
+    if (reload) {
+      if (dataPath !== this.dataPath) {
+        log("server", `DataDir option can't be changed at worldserver.conf reload, using current value (${this.dataPath}).`);
+        return false;
+      }
+      return true;
+    }
+    this.dataPath = dataPath;
+    log("server", `Using DataDir ${this.dataPath}`);
+    return true;
+  }
+
+  /** The map update `World::Update` runs after the sessions (`sMapMgr->Update(diff)`). */
+  setMapUpdate(update: ((diff: number) => void) | null): void {
+    this.mapUpdate = update;
   }
 
   getActiveAndQueuedSessionCount(): number {
@@ -125,6 +263,9 @@ export class World {
     }
 
     this.sessionUpdate?.(diff);
+
+    ///- Update objects when the timer has passed (maps, transport, creatures, ...)
+    this.mapUpdate?.(diff);
 
     if (this.timer(WorldTimer.WUPDATE_5_SECS).passed()) {
       this.timer(WorldTimer.WUPDATE_5_SECS).reset();
@@ -177,6 +318,7 @@ export class World {
     this.shutdownMask = 0;
     this.shutdownTimer = 0;
     this.exitCode = ShutdownExitCode.Shutdown;
+    sWorldSessionMgr.SendServerMessage(restarting ? SERVER_MSG_RESTART_CANCELLED : SERVER_MSG_SHUTDOWN_CANCELLED);
     log("server", `Server ${restarting ? "restart" : "shuttingdown"} cancelled.`);
   }
 
@@ -242,6 +384,7 @@ export class World {
       text += ` - ${this.shutdownReason}`;
     }
     const restarting = (this.shutdownMask & ShutdownMask.Restart) !== 0;
+    sWorldSessionMgr.SendServerMessage(restarting ? SERVER_MSG_RESTART_TIME : SERVER_MSG_SHUTDOWN_TIME, text);
     log("server", `Server ${restarting ? "restarting" : "shutdown"} in ${text}`);
   }
 }
@@ -295,4 +438,29 @@ export function startWorldUpdateLoop(
       clearTimeout(timer);
     },
   };
+}
+
+let worldInstance: World | null = null;
+
+/** `sWorld`. Set by the server at startup; code that runs without one (tests) gets a world with default config. */
+export function sWorld(): World {
+  worldInstance ??= new World(defaultWorldConfig());
+  return worldInstance;
+}
+
+export function setWorldInstance(world: World | null): void {
+  worldInstance = world;
+}
+
+/** A `WorldConfig` with every option at its `worldserver.conf.dist` default. */
+export function defaultWorldConfig(): WorldConfig {
+  const config = new ConfigMgr();
+  const policy = defaultConfigPolicy();
+  policy.missingOptionSeverity = ConfigSeverity.Skip;
+  policy.criticalOptionSeverity = ConfigSeverity.Skip;
+  policy.valueErrorSeverity = ConfigSeverity.Skip;
+  config.configure("", [], "", policy);
+  const settings = new WorldConfig(config);
+  settings.load();
+  return settings;
 }

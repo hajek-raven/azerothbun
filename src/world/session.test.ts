@@ -34,6 +34,7 @@ import { ConfigMgr, ConfigSeverity, defaultConfigPolicy } from "../common/config
 import { ServerConfig, WorldConfig } from "../game/world/world-config.ts";
 import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
 import { startWorldServer, timeOutTimeSeconds } from "./server.ts";
+import { SMSG_INIT_WORLD_STATES } from "../game/Entities/Player/PlayerUpdates.ts";
 
 test("authenticated client receives the seeded character", async () => {
   const sessionKey = new Uint8Array(40);
@@ -77,10 +78,12 @@ test("authenticated client receives the seeded character", async () => {
 
   client.send(encodeClientPacket(CMSG_PLAYER_LOGIN, new ByteWriter().writeU64(1n).toUint8Array(), crypt));
   const entered = new Map<number, Uint8Array>();
-  for (let index = 0; index < 16; index++) {
+  // the login burst, the message of the day, and `Player::UpdateZone`'s SMSG_INIT_WORLD_STATES after the add to the map
+  for (let index = 0; index < 18; index++) {
     const packet = await readServerPacket(client, crypt);
     entered.set(packet.opcode, packet.payload);
   }
+  expect(entered.has(SMSG_INIT_WORLD_STATES)).toBe(true);
   const verify = entered.get(SMSG_LOGIN_VERIFY_WORLD);
   expect(verify).toBeDefined();
   expect(verify![0]! | (verify![1]! << 8) | (verify![2]! << 16) | (verify![3]! << 24)).toBe(0);

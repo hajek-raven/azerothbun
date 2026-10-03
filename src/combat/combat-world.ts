@@ -2,13 +2,18 @@ import type { WorldTables } from "../database/world-tables.ts";
 import type { DbcStores } from "../data/dbc.ts";
 import type { CreatureSpawn, WorldData } from "../data/world.ts";
 import type { SpellStore } from "../spells/spell-info.ts";
-import { AURA_INTERRUPT_FLAG_MELEE_ATTACK, CURRENT_MELEE_SPELL, UNIT_STATE_CASTING, UNIT_STATE_CONTROLLED, UNIT_STATE_LOST_CONTROL, UNIT_STATE_NOT_MOVE } from "../spells/enums.ts";
+import { AURA_INTERRUPT_FLAG_MELEE_ATTACK, CURRENT_MELEE_SPELL, UNIT_STATE_CASTING, UNIT_STATE_CONTROLLED, UNIT_STATE_LOST_CONTROL } from "../spells/enums.ts";
 import type { SpellUnit } from "../spells/unit.ts";
 import * as spellMath from "../spells/unit-math.ts";
 import { CreatureSpellUnit, type CreatureWorld } from "./creature-spell-unit.ts";
 import { ServerConfig, type WorldConfig } from "../game/world/world-config.ts";
 import { log } from "../log.ts";
-import { creaturesNear, visibilityDistance, type SpawnIndex } from "../world/spawn.ts";
+import { CreatureWorldHooks, DeathState as CreatureDeathState, type Creature } from "../game/Entities/Creature/Creature.ts";
+import type { MovementOwner } from "../game/Movement/MovementOwner.ts";
+import { HOME_MOTION_TYPE } from "../game/Movement/MotionMaster.ts";
+import { UNIT_STATE_EVADE } from "../spells/enums.ts";
+import type { CreatureLocator } from "../world/map-world.ts";
+import { visibilityDistance } from "../world/visibility.ts";
 import { LootType, type Loot } from "../loot/loot.ts";
 import { haveLootFor, lootStores } from "../loot/templates.ts";
 import type { LootCreature } from "../world/loot-play.ts";
@@ -37,7 +42,6 @@ import {
   CREATURE_Z_ATTACK_RANGE,
   DEFAULT_COMBAT_REACH,
   INTERACTION_DISTANCE,
-  DEFAULT_PLAYER_BOUNDING_RADIUS,
   EMOTE_ONESHOT_PARRY_SHIELD,
   EMOTE_ONESHOT_WOUND_CRITICAL,
   HITINFO_AFFECTS_VICTIM,
@@ -71,7 +75,6 @@ import {
   SMSG_CANCEL_COMBAT,
   SMSG_EMOTE,
   SMSG_LOOT_LIST,
-  SMSG_MONSTER_MOVE,
   SMSG_PARTYKILLLOG,
   SMSG_UPDATE_OBJECT,
   UNIT_DYNFLAG_LOOTABLE,
@@ -95,7 +98,6 @@ import { CreatureInfoStore, isElite, isWorldBoss, type CreatureInfo } from "./cr
 import { FactionStore, hasHostility, isNeutralToAll, respondsToCallForHelp, type PlayerReputation } from "./faction.ts";
 import {
   aggroRange,
-  angleTo,
   armorReducedDamage,
   corpseDelaySeconds,
   critChanceAgainst,
@@ -106,7 +108,6 @@ import {
   killXp,
   leashTimerSeconds,
   meleeMissChance,
-  meleeRange,
   rageReward,
   rageWeaponSpeedHitFactor,
   rollDamage,
@@ -123,7 +124,6 @@ import {
   attackStopPacket,
   emotePacket,
   lootListPacket,
-  monsterMovePacket,
   partyKillLogPacket,
   unitValuesUpdate,
   UNIT_DYNAMIC_FLAGS,
@@ -184,6 +184,14 @@ export function configureCombatRates(settings: WorldConfig): CombatRates {
 }
 
 const live = new Set<CombatWorld>();
+
+// `Creature::AddToWorld` / `RemoveFromWorld`: a creature that comes into or leaves a map is linked to its live state
+CreatureWorldHooks.added = (creature) => {
+  for (const combat of live) combat.attachCreature(creature);
+};
+CreatureWorldHooks.removed = (creature) => {
+  for (const combat of live) combat.detachCreature(creature);
+};
 
 /** What `Player` exposes to the melee code. The session fills it from `PlayerStats`. */
 export type PlayerMelee = {
@@ -254,32 +262,34 @@ export type CombatPlayer = {
   killedCreature: (kill: CreatureKill) => Loot | null;
   /** `Player::UpdateCombatSkills` */
   combatSkill: (attType: number, victimLevel: number, defence: boolean) => void;
-  /** Recompute which spawns the player sees (after a corpse is removed or a creature respawns). */
-  refreshSpawns: () => void;
   /** The player's `Unit` for the spell and aura code, when the session has a spell store. */
   spellUnit?: () => SpellUnit | null;
+  /** The player on the map (`Player`: a creature chases and follows this object); null while the player is not on a map. */
+  mapObject?: () => MovementOwner | null;
 };
 
 type DeathState = "alive" | "corpse" | "dead";
 
-type Move = { from: Point; to: Point; startMs: number; durationMs: number; home: boolean };
-
 /** `Creature` runtime state. A spawn without one is alive at home at full health. */
 export type CreatureUnit = {
   info: CreatureInfo;
+  /** The map object of this creature (`Creature::m_combatUnit` links back); null while its grid is not loaded. */
+  creature: Creature | null;
   /** The creature's `Unit` for spells and auras (created on first use). */
   spell: CreatureSpellUnit | null;
   /** `ThreatManager` taunt stack (player guids, last is active). */
   taunts: number[];
   health: number;
   deathState: DeathState;
-  pos: Point & { o: number };
-  move: Move | null;
+  /** Where the creature is: the map object's position (`Creature::GetPosition`); the last known place while it has none. */
+  readonly pos: Point & { o: number };
   threat: Map<number, number>;
   victim: number | null;
   attackTimer: number;
   regenTimer: number;
+  /** `UNIT_STATE_EVADE` of the map object (`evadingWithoutObject` while it has none). */
   evading: boolean;
+  evadingWithoutObject: boolean;
   lootRecipient: number | null;
   playerDamageReq: number;
   damagedByPlayer: boolean;
@@ -292,10 +302,13 @@ export type CreatureUnit = {
   respawnTime: number;
   respawnedTime: number;
   lastLeashExtension: number;
-  splineId: number;
-  lastChaseMs: number;
-  lastFacingMs: number;
   alreadyCalledAssistance: boolean;
+  /** Update fields a chat command set (display, faction, scale, flags); they override the create block. */
+  fieldOverrides: Map<number, number>;
+  /** The combat world this state belongs to (`Creature::m_combatUnit` calls back into it). */
+  readonly host: CombatWorld;
+  /** The last known position while the creature has no map object. */
+  lastPos: Point & { o: number };
 };
 
 type PlayerState = {
@@ -322,12 +335,10 @@ export type LiveCreature = {
   dynamicFlags: number;
   npcFlags: number;
   target: bigint;
+  fields: { index: number; value: number }[];
 };
 
 const AGGRO_SCAN_INTERVAL_MS = 250;
-const CHASE_REPATH_MS = 250;
-const FACING_INTERVAL_MS = 400;
-const FACING_TOLERANCE = 0.35;
 
 export function highGuidIsCreature(guid: bigint): boolean {
   return guid >> 48n === 0xf130n;
@@ -345,12 +356,11 @@ export class CombatWorld implements CreatureWorld {
   private readonly players = new Map<number, PlayerState>();
   private readonly assists: AssistEvent[] = [];
   private lastUpdateMs: number | null = null;
-  private nextSplineId = 1;
   private spellStore: SpellStore | null = null;
 
   constructor(
     world: WorldData,
-    private readonly spawns: SpawnIndex,
+    private readonly spawns: CreatureLocator,
     private readonly db: WorldTables | null,
     dbc: DbcStores | null = null,
     factions?: FactionStore,
@@ -561,6 +571,7 @@ export class CombatWorld implements CreatureWorld {
       dynamicFlags: this.dynamicFlagsFor(unit, viewer),
       npcFlags: unit.deathState === "alive" ? unit.info.npcFlags : 0,
       target: unit.victim !== null ? BigInt(unit.victim) : 0n,
+      fields: [...unit.fieldOverrides].map(([index, value]) => ({ index, value })),
     };
   }
 
@@ -632,7 +643,7 @@ export class CombatWorld implements CreatureWorld {
     }
     const place = player.position();
     const unitPos = this.position(unit, nowMs);
-    const leeway = player.moving() && unit.move !== null && !unit.move.home;
+    const leeway = player.moving() && this.isMovingNotHome(unit);
     if (state.attackTimer[BASE_ATTACK] === 0) {
       if (place.map !== unit.info.map || !withinMeleeRange(place, DEFAULT_COMBAT_REACH, unitPos, unit.info.combatReach, leeway)) {
         state.attackTimer[BASE_ATTACK] = 100;
@@ -910,7 +921,7 @@ export class CombatWorld implements CreatureWorld {
       if ((pos.x - at.x) ** 2 + (pos.y - at.y) ** 2 + (pos.z - at.z) ** 2 > (radius + unit.combatReach) ** 2) continue;
       result.push(unit);
     }
-    for (const spawn of creaturesNear(this.spawns, { map: origin.map, x: at.x, y: at.y, z: at.z }, radius + 10)) {
+    for (const spawn of this.spawns.creaturesNear({ map: origin.map, x: at.x, y: at.y, z: at.z }, radius + 10)) {
       const unit = this.creatureUnit(spawn.guid);
       if (!unit || unit.deathState === "dead") continue;
       const pos = this.position(unit, this.clockMs());
@@ -974,22 +985,84 @@ export class CombatWorld implements CreatureWorld {
     this.sendToViewers(unit, SMSG_UPDATE_OBJECT, unitValuesUpdate(unit.info.guid, fields));
   }
 
-  creatureAttackStop(unit: CreatureUnit): void {
+  creatureAttackStop(unit: CreatureUnit): boolean {
+    const had = unit.victim !== null;
     this.stopCreatureAttack(unit, false);
+    return had;
   }
 
+  /** `Unit::StopMoving` (a root or stun) */
   creatureStopMoving(unit: CreatureUnit): void {
-    if (!unit.move) return;
-    const pos = this.position(unit, this.clockMs());
-    unit.pos = pos;
-    unit.move = null;
-    this.sendToViewers(unit, SMSG_MONSTER_MOVE, monsterMovePacket({ guid: unit.info.guid, splineId: this.splineId(unit), from: pos, stop: true }));
+    unit.creature?.stopMoving();
   }
 
+  /** `Unit::NearTeleportTo` */
   creatureNearTeleport(unit: CreatureUnit, position: { x: number; y: number; z: number; o: number }): void {
-    unit.move = null;
-    unit.pos = { ...position };
-    this.sendToViewers(unit, SMSG_MONSTER_MOVE, monsterMovePacket({ guid: unit.info.guid, splineId: this.splineId(unit), from: unit.pos, stop: true }));
+    if (unit.creature?.isInWorld()) unit.creature.nearTeleportTo(position.x, position.y, position.z, position.o);
+    else unit.lastPos = { ...position };
+  }
+
+  /** `Unit::propagateSpeedChange` */
+  creaturePropagateSpeedChange(unit: CreatureUnit): void {
+    unit.creature?.propagateSpeedChange();
+  }
+
+  // What a `Creature` linked to a unit asks for its `Unit` members (`Creature::m_combatUnit`).
+
+  /** `Unit::GetVictim` */
+  creatureVictimObject(unit: CreatureUnit): MovementOwner | null {
+    if (unit.victim === null) return null;
+    return this.players.get(unit.victim)?.player.mapObject?.() ?? null;
+  }
+
+  /** `Unit::Attack`: the victim is set once; `SMSG_ATTACKSTART` and the target fields go to the viewers. */
+  creatureAttack(unit: CreatureUnit, victim: MovementOwner, _meleeAttack: boolean): boolean {
+    const state = this.players.get(Number(victim.getGUID() & 0xffffffffn));
+    if (!state || unit.deathState !== "alive") return false;
+    this.setVictim(unit, state.player.guid);
+    return true;
+  }
+
+  /** `Unit::EngageWithTarget` */
+  creatureEngageWithTarget(unit: CreatureUnit, target: MovementOwner): void {
+    const state = this.players.get(Number(target.getGUID() & 0xffffffffn));
+    if (state) this.engagePlayer(unit, state.player, this.clockMs());
+  }
+
+  /** `Unit::IsValidAttackTarget` for a player target. */
+  creatureIsValidAttackTarget(unit: CreatureUnit, target: MovementOwner): boolean {
+    const state = this.players.get(Number(target.getGUID() & 0xffffffffn));
+    if (!state) return false;
+    return this.canCreatureAttack(unit, state.player, this.clockMs(), this.nowSeconds(), true);
+  }
+
+  /** `ObjectAccessor::GetUnit` */
+  creatureUnitObject(_unit: CreatureUnit, guid: bigint): MovementOwner | null {
+    if (highGuidIsCreature(guid)) return (this.units.get(spawnGuidOf(guid))?.creature ?? this.spawns.findCreature(this.mapOf(_unit), spawnGuidOf(guid)))?.asMovementOwner() ?? null;
+    return this.players.get(Number(guid & 0xffffffffn))?.player.mapObject?.() ?? null;
+  }
+
+  /** `Creature::SetNoCallAssistance` */
+  creatureSetNoCallAssistance(unit: CreatureUnit, value: boolean): void {
+    unit.alreadyCalledAssistance = value;
+  }
+
+  /** `Creature::CallAssistance` */
+  creatureCallAssistance(unit: CreatureUnit): void {
+    const victim = unit.victim ?? unit.threat.keys().next().value;
+    if (victim !== undefined) this.callAssistance(unit, victim, this.clockMs());
+  }
+
+  /** The map id of a unit's creature. */
+  private mapOf(unit: CreatureUnit): number {
+    return unit.info.map;
+  }
+
+  /** The map object of the creature a player is attacking (`Unit::GetVictim` of the player), when its grid is loaded. */
+  victimObjectOf(playerGuid: number): MovementOwner | null {
+    const victim = this.players.get(playerGuid)?.victim;
+    if (victim === null || victim === undefined) return null;
+    return (this.units.get(victim)?.creature as unknown as MovementOwner | null) ?? null;
   }
 
   creatureVictim(unit: CreatureUnit): SpellUnit | null {
@@ -998,6 +1071,100 @@ export class CombatWorld implements CreatureWorld {
 
   creatureUnitFlags(unit: CreatureUnit): number {
     return this.unitFlags(unit);
+  }
+
+  // ------------------------------------------------------------------ chat commands
+
+  /** Every spawn with runtime state (`Map::GetCreatureBySpawnIdStore` for the spawns that were touched). */
+  liveUnits(): IterableIterator<CreatureUnit> {
+    return this.units.values();
+  }
+
+  /** `Unit::Kill(killer, creature)` from `.die` (the killer is a player in the world, or none). */
+  commandKillCreature(spawnGuid: number, killerGuid: number): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (!unit || unit.deathState !== "alive") return;
+    this.killCreature(unit, this.players.get(killerGuid)?.player ?? null, this.clockMs());
+  }
+
+  /** `Unit::DealDamage(attacker, creature, damage, DIRECT_DAMAGE)` from `.damage` / `.die`. */
+  commandDamageCreature(spawnGuid: number, damage: number, attackerGuid: number): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (!unit || unit.deathState !== "alive" || damage <= 0) return;
+    this.damageCreature(unit, damage, this.players.get(attackerGuid)?.player ?? null, this.clockMs());
+  }
+
+  /** `Creature::LowerPlayerDamageReq` */
+  lowerPlayerDamageReq(spawnGuid: number, unDamage: number): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (unit && unit.playerDamageReq) unit.playerDamageReq = unit.playerDamageReq > unDamage ? unit.playerDamageReq - unDamage : 0;
+  }
+
+  /** `Creature::Respawn(true)`: a dead creature (corpse or despawned) comes back now. */
+  commandRespawnCreature(spawnGuid: number): void {
+    const unit = this.units.get(spawnGuid);
+    if (!unit || unit.deathState === "alive") return;
+    this.respawn(unit, this.nowSeconds());
+  }
+
+  /** A creature update field set by a command (`SetDisplayId`, `SetFaction`, `SetObjectScale`, flags). */
+  setCreatureField(spawnGuid: number, index: number, value: number): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (!unit) return;
+    unit.fieldOverrides.set(index, value >>> 0);
+    this.sendToViewers(unit, SMSG_UPDATE_OBJECT, unitValuesUpdate(unit.info.guid, [{ index, value: value >>> 0 }]));
+  }
+
+  creatureFieldOverride(spawnGuid: number, index: number): number | null {
+    return this.units.get(spawnGuid)?.fieldOverrides.get(index) ?? null;
+  }
+
+  /** `Unit::SetHealth` on a creature from a command. */
+  setCreatureHealth(spawnGuid: number, health: number): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (!unit || unit.deathState !== "alive") return;
+    unit.health = Math.max(0, Math.min(Math.trunc(health), this.maxHealthOf(unit)));
+    this.sendToViewers(unit, SMSG_UPDATE_OBJECT, unitValuesUpdate(unit.info.guid, [{ index: UNIT_FIELD_HEALTH, value: unit.health }]));
+  }
+
+  /** `Unit::CombatStop` on a creature. */
+  creatureCombatStop(spawnGuid: number): void {
+    const unit = this.units.get(spawnGuid);
+    if (unit) this.stopCreatureAttack(unit, false);
+  }
+
+  /** `MotionMaster::MovePoint` from `.cometome` (the creature walks to the point over the nav mesh). */
+  commandMovePoint(spawnGuid: number, to: Point): void {
+    const unit = this.liveUnit(spawnGuid);
+    if (!unit || unit.deathState !== "alive" || !unit.creature?.isInWorld()) return;
+    unit.creature.getMotionMaster().movePoint(0, to.x, to.y, to.z);
+  }
+
+  /** The creature's current motion (`MotionMaster::GetMotionSlot` for `.movegens`). */
+  creatureMotion(spawnGuid: number): { victim: number | null; evading: boolean; moving: boolean; home: boolean; destination: Point | null } | null {
+    const unit = this.units.get(spawnGuid);
+    if (!unit) return null;
+    const creature = unit.creature;
+    const out = { x: 0, y: 0, z: 0 };
+    const hasDestination = creature?.getMotionMaster().getDestination(out) ?? false;
+    return {
+      victim: unit.victim,
+      evading: unit.evading,
+      moving: creature ? !creature.movespline.finalized() : false,
+      home: creature?.getMotionMaster().getCurrentMovementGeneratorType() === HOME_MOTION_TYPE,
+      destination: hasDestination ? out : null,
+    };
+  }
+
+  /** The creature moves, and not on its way home (`unit.move !== null && !unit.move.home`). */
+  private isMovingNotHome(unit: CreatureUnit): boolean {
+    const creature = unit.creature;
+    return !!creature && !creature.movespline.finalized() && creature.getMotionMaster().getCurrentMovementGeneratorType() !== HOME_MOTION_TYPE;
+  }
+
+  maxHealthOfSpawn(spawnGuid: number): number {
+    const unit = this.liveUnit(spawnGuid);
+    return unit ? this.maxHealthOf(unit) : 0;
   }
 
   /** `UNIT_FIELD_ARMOR` with aura modifiers once the creature has a spell unit. */
@@ -1058,10 +1225,6 @@ export class CombatWorld implements CreatureWorld {
     }
 
     // setDeathState(JustDied) → Corpse
-    const pos = this.position(unit, nowMs);
-    const wasMoving = unit.move !== null;
-    unit.pos = pos;
-    unit.move = null;
     unit.health = 0;
     unit.deathState = "corpse";
     if (unit.spell) {
@@ -1073,9 +1236,9 @@ export class CombatWorld implements CreatureWorld {
     const corpseDelay = corpseDelaySeconds(info.rank, this.rates.corpseDecay);
     unit.corpseRemoveTime = nowSec + corpseDelay;
     unit.respawnTime = nowSec + info.respawnDelay + corpseDelay;
-    if (wasMoving) {
-      this.sendToViewers(unit, SMSG_MONSTER_MOVE, monsterMovePacket({ guid: info.guid, splineId: this.splineId(unit), from: pos, stop: true }));
-    }
+    // `Unit::setDeathState(JustDied)`: the motion stack goes to idle and the creature stops where it is
+    unit.creature?.ai()?.EngagementOver?.();
+    unit.creature?.unitDied();
     this.stopCreatureAttack(unit, true);
     unit.threat.clear();
     unit.victim = null;
@@ -1158,7 +1321,9 @@ export class CombatWorld implements CreatureWorld {
         unit.loot = null;
         unit.lootable = false;
         unit.skinnable = false;
-        unit.pos = { ...unit.info.home };
+        unit.lastPos = { ...unit.info.home };
+        // the corpse goes back to its spawn position (`Creature::RemoveCorpse`)
+        unit.creature?.relocateToRespawnPosition();
         this.refreshViewers(unit);
       }
       return;
@@ -1169,14 +1334,16 @@ export class CombatWorld implements CreatureWorld {
       return;
     }
     unit.attackTimer = Math.max(0, unit.attackTimer - diff);
-    if (unit.move && nowMs - unit.move.startMs >= unit.move.durationMs) {
-      this.finishMove(unit, nowMs);
-    }
+    // `Unit::Update` runs the spline and the motion master (`Creature::Update` of the map object); an evading creature
+    // is walking home and does not fight
     if (unit.evading) {
       return;
     }
     if (unit.threat.size > 0) {
       this.updateEngaged(unit, nowMs, nowSec);
+    } else if (unit.creature?.isEngaged()) {
+      // `CreatureAI::UpdateVictim`: engaged with an empty threat list -> `EnterEvadeMode(EVADE_REASON_NO_HOSTILES)`
+      this.enterEvadeMode(unit);
     }
     if (unit.deathState !== "alive") {
       return;
@@ -1191,27 +1358,22 @@ export class CombatWorld implements CreatureWorld {
       }
     }
     const idleSpells = !unit.spell || (unit.spell.ownedAuras.length === 0 && unit.spell.appliedAuras.length === 0 && unit.spell.activeSpells.size === 0);
-    if (idleSpells && unit.threat.size === 0 && unit.move === null && unit.health >= this.maxHealthOf(unit) && unit.lootRecipient === null && !this.targeted(unit)) {
+    if (idleSpells && unit.threat.size === 0 && !this.isMovingNotHome(unit) && unit.health >= this.maxHealthOf(unit) && unit.lootRecipient === null && !this.targeted(unit)) {
+      this.unlink(unit);
       this.units.delete(unit.info.spawnGuid);
     }
   }
 
-  /** `CreatureAI::UpdateVictim` + chase + `DoMeleeAttackIfReady`. */
+  /** `CreatureAI::UpdateVictim` + `DoMeleeAttackIfReady`; the chase is the creature's `ChaseMovementGenerator`. */
   private updateEngaged(unit: CreatureUnit, nowMs: number, nowSec: number): void {
     const victimGuid = this.reselectVictim(unit, nowMs, nowSec);
     if (victimGuid === null) {
-      this.enterEvadeMode(unit, nowMs);
+      this.enterEvadeMode(unit);
       return;
     }
     const state = this.players.get(victimGuid)!;
     if (unit.victim !== victimGuid) {
-      unit.victim = victimGuid;
-      this.sendToViewers(unit, SMSG_ATTACKSTART, attackStartPacket(unit.info.guid, BigInt(victimGuid)));
-      this.sendToViewers(unit, SMSG_UPDATE_OBJECT, unitValuesUpdate(unit.info.guid, [
-        { index: UNIT_FIELD_TARGET, value: victimGuid },
-        { index: UNIT_FIELD_TARGET + 1, value: 0 },
-        { index: UNIT_FIELD_FLAGS, value: this.unitFlags(unit) },
-      ]));
+      this.attackStart(unit, state);
     }
     if (this.passive(unit.info)) {
       return;
@@ -1219,19 +1381,39 @@ export class CombatWorld implements CreatureWorld {
     const player = state.player;
     const place = player.position();
     const pos = this.position(unit, nowMs);
-    const leeway = player.moving() && unit.move !== null;
+    const leeway = player.moving() && unit.creature?.isMoving() === true;
     const inRange = withinMeleeRange(pos, unit.info.combatReach, place, DEFAULT_COMBAT_REACH, leeway);
     const controlled = unit.spell?.unitState ?? 0;
-    if (!inRange) {
-      if (!(controlled & UNIT_STATE_NOT_MOVE)) this.chase(unit, player, nowMs);
-    } else if (unit.move === null && !(controlled & UNIT_STATE_LOST_CONTROL)) {
-      this.faceVictim(unit, player, nowMs);
-    }
     // `Unit::AttackerStateUpdate` returns early while pacified, out of control, or casting.
     if (inRange && unit.attackTimer === 0 && (this.unitFlags(unit) & UNIT_FLAG_PACIFIED) === 0 && !(controlled & (UNIT_STATE_LOST_CONTROL | UNIT_STATE_CASTING))) {
       this.creatureSwing(unit, state, nowMs);
       unit.attackTimer = unit.spell ? unit.spell.stats.attackTime(BASE_ATTACK) : unit.info.attackTime;
     }
+  }
+
+  /** `UnitAI::AttackStart`: `Unit::Attack(victim, true)` then `MotionMaster::MoveChase(victim)`. */
+  private attackStart(unit: CreatureUnit, state: PlayerState): void {
+    const creature = unit.creature;
+    const target = state.player.mapObject?.() ?? null;
+    const ai = creature?.isInWorld() ? creature.ai() : null;
+    if (ai && target && !this.passive(unit.info)) {
+      ai.AttackStart?.(target);
+      if (unit.victim === state.player.guid) return;
+    }
+    this.setVictim(unit, state.player.guid);
+  }
+
+  /** `Unit::Attack`: the victim, `SMSG_ATTACKSTART`, and the target and flag fields. */
+  private setVictim(unit: CreatureUnit, victimGuid: number): void {
+    if (unit.victim === victimGuid) return;
+    unit.victim = victimGuid;
+    unit.creature?.setTarget(BigInt(victimGuid));
+    this.sendToViewers(unit, SMSG_ATTACKSTART, attackStartPacket(unit.info.guid, BigInt(victimGuid)));
+    this.sendToViewers(unit, SMSG_UPDATE_OBJECT, unitValuesUpdate(unit.info.guid, [
+      { index: UNIT_FIELD_TARGET, value: victimGuid },
+      { index: UNIT_FIELD_TARGET + 1, value: 0 },
+      { index: UNIT_FIELD_FLAGS, value: this.unitFlags(unit) },
+    ]));
   }
 
   private targeted(unit: CreatureUnit): boolean {
@@ -1322,11 +1504,27 @@ export class CombatWorld implements CreatureWorld {
     if (!leash) {
       return true;
     }
-    return distance2d(pos, unit.info.home) <= leash;
+    // `Creature::GetHomePosition` (a waypoint creature's home follows its path)
+    const homePos = unit.creature?.isInWorld() ? unit.creature.getHomePosition() : null;
+    const home = homePos ? { x: homePos.getPositionX(), y: homePos.getPositionY(), z: homePos.getPositionZ() } : unit.info.home;
+    return distance2d(pos, home) <= leash;
   }
 
-  /** `CreatureAI::EnterEvadeMode` → `MoveTargetedHome`. */
-  private enterEvadeMode(unit: CreatureUnit, nowMs: number): void {
+  /** `CreatureAI::EnterEvadeMode`: `_EnterEvadeMode` (`evadeCombat`), then `MotionMaster::MoveTargetedHome` of the creature's AI. */
+  private enterEvadeMode(unit: CreatureUnit): void {
+    const creature = unit.creature;
+    const ai = creature?.isInWorld() ? creature.ai() : null;
+    if (ai) {
+      ai.EnterEvadeMode?.();
+      return;
+    }
+    // no map object (its grid is not loaded): there is nothing to walk, the creature is home again
+    this.evadeCombat(unit);
+    unit.evading = false;
+  }
+
+  /** `CreatureAI::_EnterEvadeMode`: the threat list, the tap, the damage requirement, the auras, and the packets. */
+  private evadeCombat(unit: CreatureUnit): void {
     const info = unit.info;
     unit.evading = true;
     unit.spell?.removeEvadeAuras();
@@ -1334,6 +1532,7 @@ export class CombatWorld implements CreatureWorld {
     this.stopCreatureAttack(unit, false);
     unit.threat.clear();
     unit.victim = null;
+    unit.creature?.setTarget();
     unit.lootRecipient = null;
     unit.playerDamageReq = Math.trunc(unit.health / 2);
     unit.damagedByPlayer = false;
@@ -1349,21 +1548,11 @@ export class CombatWorld implements CreatureWorld {
       { index: UNIT_FIELD_TARGET + 1, value: 0 },
     ]));
     this.sendDynamicFlags(unit);
-    const from = this.position(unit, nowMs);
-    const to = { x: info.home.x, y: info.home.y, z: info.home.z };
-    const distance = Math.sqrt(distanceSq(from, to));
-    if (distance < 0.1) {
-      unit.move = null;
-      unit.evading = false;
-      unit.pos = { ...info.home };
-      return;
-    }
-    this.startMove(unit, from, to, distance, nowMs, true);
-    this.sendToViewers(
-      unit,
-      SMSG_MONSTER_MOVE,
-      monsterMovePacket({ guid: info.guid, splineId: this.splineId(unit), from, to, durationMs: unit.move!.durationMs, facingAngle: info.home.o }),
-    );
+  }
+
+  /** `CreatureAI::_EnterEvadeMode` as the creature's AI calls it. */
+  creatureEvadeCombat(unit: CreatureUnit): void {
+    this.evadeCombat(unit);
   }
 
   private stopCreatureAttack(unit: CreatureUnit, nowDead: boolean): void {
@@ -1376,99 +1565,30 @@ export class CombatWorld implements CreatureWorld {
   /** `Creature::Respawn` */
   private respawn(unit: CreatureUnit, nowSec: number): void {
     const info = unit.info;
+    this.unlink(unit);
     this.units.delete(info.spawnGuid);
     const fresh = this.createUnit(info);
     fresh.respawnedTime = nowSec;
     this.units.set(info.spawnGuid, fresh);
+    this.link(fresh);
+    // `Creature::Respawn` -> `RemoveCorpse` puts the creature back at its spawn, then the JustRespawned branch of
+    // `Creature::setDeathState`: motion is reinitialized, movement flags and states reset
+    fresh.creature?.relocateToRespawnPosition();
+    fresh.creature?.setDeathState(CreatureDeathState.JustRespawned);
     log("world", `${info.entry} (${info.spawnGuid}) respawned`);
     this.refreshViewers(fresh);
   }
 
-  /** `ChaseMovementGenerator`: run straight at the victim and stop in melee reach. */
-  private chase(unit: CreatureUnit, player: CombatPlayer, nowMs: number): void {
-    if (nowMs - unit.lastChaseMs < CHASE_REPATH_MS && unit.move !== null) {
-      return;
-    }
-    const place = player.position();
-    const reach = meleeRange(unit.info.combatReach, DEFAULT_COMBAT_REACH);
-    if (unit.move) {
-      const dest = unit.move.to;
-      if (withinMeleeRange(dest, unit.info.combatReach, place, DEFAULT_COMBAT_REACH) && distanceSq(dest, place) < (reach - 1) * (reach - 1)) {
-        return;
-      }
-    }
-    unit.lastChaseMs = nowMs;
-    const from = this.position(unit, nowMs);
-    const total = Math.sqrt(distanceSq(from, place));
-    const stop = Math.min(total, Math.max(0.5, Math.min(reach - 1.5, unit.info.combatReach + DEFAULT_PLAYER_BOUNDING_RADIUS)));
-    const ratio = total > 0 ? (total - stop) / total : 0;
-    const to = { x: from.x + (place.x - from.x) * ratio, y: from.y + (place.y - from.y) * ratio, z: from.z + (place.z - from.z) * ratio };
-    const distance = total - stop;
-    if (distance <= 0.05) {
-      return;
-    }
-    this.startMove(unit, from, to, distance, nowMs, false);
-    this.sendToViewers(
-      unit,
-      SMSG_MONSTER_MOVE,
-      monsterMovePacket({ guid: unit.info.guid, splineId: this.splineId(unit), from, to, durationMs: unit.move!.durationMs, facingTarget: BigInt(player.guid) }),
-    );
+  /** Where the creature is (`Creature::GetPosition`). */
+  private position(unit: CreatureUnit, _nowMs: number): Point & { o: number } {
+    return unit.pos;
   }
 
-  private faceVictim(unit: CreatureUnit, player: CombatPlayer, nowMs: number): void {
-    const place = player.position();
-    const wanted = angleTo(unit.pos, place);
-    let delta = Math.abs(wanted - unit.pos.o);
-    if (delta > Math.PI) {
-      delta = Math.PI * 2 - delta;
-    }
-    if (delta < FACING_TOLERANCE || nowMs - unit.lastFacingMs < FACING_INTERVAL_MS) {
-      return;
-    }
-    unit.lastFacingMs = nowMs;
-    unit.pos.o = wanted;
-    this.sendToViewers(
-      unit,
-      SMSG_MONSTER_MOVE,
-      monsterMovePacket({ guid: unit.info.guid, splineId: this.splineId(unit), from: unit.pos, facingTarget: BigInt(player.guid) }),
-    );
-  }
-
-  private startMove(unit: CreatureUnit, from: Point, to: Point, distance: number, nowMs: number, home: boolean): void {
-    // `Unit::GetSpeed(MOVE_RUN)`: aura speed rates live on the spell unit.
-    const speed = unit.spell ? unit.spell.speed(1 /* MOVE_RUN */) : unit.info.runSpeed > 0 ? unit.info.runSpeed : 7;
-    unit.pos = { ...from, o: angleTo(from, to) };
-    unit.move = { from, to, startMs: nowMs, durationMs: Math.max(1, (distance / speed) * 1000), home };
-  }
-
-  private finishMove(unit: CreatureUnit, _nowMs: number): void {
-    const move = unit.move!;
-    unit.pos = { ...move.to, o: move.home ? unit.info.home.o : angleTo(move.from, move.to) };
-    unit.move = null;
-    if (move.home) {
-      unit.evading = false;
-      unit.pos = { ...unit.info.home };
-    }
-  }
-
-  /** Where the creature is now, along its spline. */
-  private position(unit: CreatureUnit, nowMs: number): Point & { o: number } {
-    const move = unit.move;
-    if (!move) {
-      return unit.pos;
-    }
-    const t = Math.min(1, Math.max(0, (nowMs - move.startMs) / move.durationMs));
-    return {
-      x: move.from.x + (move.to.x - move.from.x) * t,
-      y: move.from.y + (move.to.y - move.from.y) * t,
-      z: move.from.z + (move.to.z - move.from.z) * t,
-      o: unit.pos.o,
-    };
-  }
-
-  private splineId(unit: CreatureUnit): number {
-    unit.splineId = this.nextSplineId++;
-    return unit.splineId;
+  /** Where a spawn without combat state is now: its map object, else its spawn position. */
+  private currentPosition(info: CreatureInfo): Point & { o: number } {
+    const creature = this.spawns.findCreature(info.map, info.spawnGuid);
+    if (creature?.isInWorld()) return { x: creature.getPositionX(), y: creature.getPositionY(), z: creature.getPositionZ(), o: creature.getOrientation() };
+    return info.home;
   }
 
   /** `Unit::AttackerStateUpdate` for a creature hitting a player. */
@@ -1615,7 +1735,7 @@ export class CombatWorld implements CreatureWorld {
     }
     const pos = this.position(unit, nowMs);
     const assistants: number[] = [];
-    for (const spawn of creaturesNear(this.spawns, { map: unit.info.map, x: pos.x, y: pos.y, z: pos.z }, radius)) {
+    for (const spawn of this.spawns.creaturesNear({ map: unit.info.map, x: pos.x, y: pos.y, z: pos.z }, radius)) {
       if (spawn.guid === unit.info.spawnGuid) {
         continue;
       }
@@ -1624,7 +1744,7 @@ export class CombatWorld implements CreatureWorld {
         continue;
       }
       const otherUnit = this.units.get(spawn.guid);
-      const otherPos = otherUnit ? this.position(otherUnit, nowMs) : other.home;
+      const otherPos = otherUnit ? this.position(otherUnit, nowMs) : this.currentPosition(other);
       if (distanceSq(otherPos, pos) > radius * radius) {
         continue;
       }
@@ -1702,6 +1822,8 @@ export class CombatWorld implements CreatureWorld {
       unit.threat.set(player.guid, 0);
     }
     if (fresh) {
+      unit.creature?.ai()?.EngagementStart?.(null);
+      unit.creature?.atEngage();
       unit.lastLeashExtension = Math.floor(nowMs / 1000);
       if (!this.passive(unit.info)) {
         this.sendToViewers(unit, SMSG_AI_REACTION, aiReactionPacket(unit.info.guid, AI_REACTION_HOSTILE));
@@ -1722,7 +1844,7 @@ export class CombatWorld implements CreatureWorld {
     const place = player.position();
     const nowSec = Math.floor(nowMs / 1000);
     const reaction = this.reactionPlayer(player);
-    for (const spawn of creaturesNear(this.spawns, place, 45 * this.rates.aggro + 10)) {
+    for (const spawn of this.spawns.creaturesNear(place, 45 * this.rates.aggro + 10)) {
       const info = this.infos.info(spawn.guid);
       if (!info || !this.canStartAttack(info, player, reaction, spawn)) {
         continue;
@@ -1734,7 +1856,7 @@ export class CombatWorld implements CreatureWorld {
       if (unit && unit.threat.size > 0) {
         continue;
       }
-      const pos = unit ? this.position(unit, nowMs) : info.home;
+      const pos = unit ? this.position(unit, nowMs) : this.currentPosition(info);
       if (Math.abs(pos.z - place.z) > CREATURE_Z_ATTACK_RANGE) {
         continue;
       }
@@ -1809,21 +1931,39 @@ export class CombatWorld implements CreatureWorld {
     }
     const created = this.createUnit(info);
     this.units.set(spawnGuid, created);
+    this.link(created);
     return created;
   }
 
   private createUnit(info: CreatureInfo): CreatureUnit {
-    return {
+    const unit: CreatureUnit = {
       info,
+      creature: null,
       health: info.maxHealth,
       deathState: "alive",
-      pos: { ...info.home },
-      move: null,
+      lastPos: { ...info.home },
+      get pos() {
+        const creature = unit.creature;
+        if (creature?.isInWorld()) return { x: creature.getPositionX(), y: creature.getPositionY(), z: creature.getPositionZ(), o: creature.getOrientation() };
+        return unit.lastPos;
+      },
       threat: new Map(),
       victim: null,
       attackTimer: 0,
       regenTimer: CREATURE_REGEN_INTERVAL,
-      evading: false,
+      get evading() {
+        const creature = unit.creature;
+        return creature?.isInWorld() ? creature.hasUnitState(UNIT_STATE_EVADE) : unit.evadingWithoutObject;
+      },
+      set evading(value: boolean) {
+        unit.evadingWithoutObject = value;
+        const creature = unit.creature;
+        if (creature?.isInWorld()) {
+          if (value) creature.addUnitState(UNIT_STATE_EVADE);
+          else creature.clearUnitState(UNIT_STATE_EVADE);
+        }
+      },
+      evadingWithoutObject: false,
       lootRecipient: null,
       playerDamageReq: Math.trunc(info.maxHealth / 2),
       damagedByPlayer: false,
@@ -1834,13 +1974,13 @@ export class CombatWorld implements CreatureWorld {
       respawnTime: 0,
       respawnedTime: 0,
       lastLeashExtension: 0,
-      splineId: 0,
-      lastChaseMs: 0,
-      lastFacingMs: 0,
       alreadyCalledAssistance: false,
       spell: null,
       taunts: [],
+      fieldOverrides: new Map(),
+      host: this,
     };
+    return unit;
   }
 
   /** Runtime state for a spawn, if it has any (tests and the session's loot checks). */
@@ -1912,12 +2052,43 @@ export class CombatWorld implements CreatureWorld {
     }
   }
 
+  /** `Creature::RemoveCorpse` / `Respawn` → `UpdateObjectVisibility`: the players near it get it created or destroyed. */
   private refreshViewers(unit: CreatureUnit): void {
-    for (const state of this.players.values()) {
-      if (state.player.position().map === unit.info.map) {
-        state.player.refreshSpawns();
-      }
+    unit.creature?.updateObjectVisibility(true);
+  }
+
+  // ------------------------------------------------------------------ the map objects
+
+  /** The creature of this unit is on a map: it reads the unit's death state and health (`Creature::m_combatUnit`). */
+  private link(unit: CreatureUnit): void {
+    const creature = this.spawns.findCreature(unit.info.map, unit.info.spawnGuid);
+    unit.creature = creature;
+    if (creature) creature.m_combatUnit = unit;
+  }
+
+  private unlink(unit: CreatureUnit): void {
+    if (unit.creature) unit.lastPos = { ...unit.pos };
+    if (unit.creature && unit.creature.m_combatUnit === unit) unit.creature.m_combatUnit = null;
+    unit.creature = null;
+  }
+
+  /** `Creature::AddToWorld`: a creature of a loaded grid that has live state is linked to it. */
+  attachCreature(creature: Creature): void {
+    const unit = this.units.get(creature.getSpawnId());
+    if (!unit || unit.info.map !== creature.getMapId()) return;
+    unit.creature = creature;
+    creature.m_combatUnit = unit;
+  }
+
+  /** `Creature::RemoveFromWorld`: the grid unloaded; the state stays (corpse, respawn timer) until the grid loads again. */
+  detachCreature(creature: Creature): void {
+    const unit = creature.m_combatUnit;
+    if (unit && this.units.get(unit.info.spawnGuid) === unit) {
+      unit.lastPos = { ...unit.pos };
+      unit.evadingWithoutObject = unit.evading;
+      unit.creature = null;
     }
+    creature.m_combatUnit = null;
   }
 
   /** `WorldObject::SendMessageToSet` from a creature. `also` gets it even before its client knows the creature. */
@@ -2082,15 +2253,15 @@ function skillOutcome(outcome: MeleeHitOutcome, victim: boolean): boolean {
   }
 }
 
-const shared = new WeakMap<SpawnIndex, CombatWorld>();
+const shared = new WeakMap<WorldData, CombatWorld>();
 
-/** One `CombatWorld` per spawn index, so every session on the server shares creature state. */
-export function combatWorldFor(world: WorldData, spawns: SpawnIndex, db: WorldTables | null, dbc: DbcStores | null): CombatWorld {
-  const found = shared.get(spawns);
+/** One `CombatWorld` per world data, so every session on the server shares creature state. */
+export function combatWorldFor(world: WorldData, spawns: CreatureLocator, db: WorldTables | null, dbc: DbcStores | null): CombatWorld {
+  const found = shared.get(world);
   if (found) {
     return found;
   }
   const created = new CombatWorld(world, spawns, db, dbc);
-  shared.set(spawns, created);
+  shared.set(world, created);
   return created;
 }

@@ -1,10 +1,11 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { acoreWorldData } from "../data/test-world-data.ts";
 import { seededTestDatabases } from "../database/test-db.ts";
 import { combatWorldFor } from "../combat/combat-world.ts";
 import { RACE_FACTION_TEMPLATE } from "../combat/faction.ts";
 import { REP_FRIENDLY } from "../combat/constants.ts";
-import { creaturesNear, indexSpawns } from "./spawn.ts";
+import { mapCreatureLocator } from "./map-world.ts";
+import { advanceMaps, setUpTestMapWorld, staticCreatureLocator, tearDownTestMapWorld } from "./map-world.test-util.ts";
 import { saveSessionKey } from "../db.ts";
 import { ByteWriter } from "../net/byte-buffer.ts";
 import { SpellStore } from "../spells/spell-info.ts";
@@ -16,6 +17,10 @@ import { CMSG_CANCEL_CAST, CMSG_CAST_SPELL, SMSG_AURA_UPDATE, SMSG_LEARNED_SPELL
 import { CMSG_PLAYER_LOGIN } from "./opcodes.ts";
 import { authSeed, CMSG_AUTH_SESSION, sessionDigest } from "./packets.ts";
 import { WorldSession } from "./session.ts";
+
+afterEach(() => {
+  tearDownTestMapWorld();
+});
 
 test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("known heal casts after its cast time and changes health", async () => {
   const db = await seededTestDatabases();
@@ -191,7 +196,8 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("Fireball damages 
   const key = crypto.getRandomValues(new Uint8Array(40));
   await saveSessionKey(db.login, "TEST", key);
   const world = await acoreWorldData();
-  const spawns = indexSpawns(world);
+  setUpTestMapWorld(world);
+  const spawns = mapCreatureLocator;
   const spells = await SpellStore.load("data/dbc", world.tables());
   const session = new WorldSession(db, world, spawns, undefined, null, undefined, undefined, undefined, spells);
   const received: number[] = [];
@@ -209,7 +215,7 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("Fireball damages 
   const combat = combatWorldFor(world, spawns, world.tables(), null);
   const start = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
   const player = { race: 1, classId: 1, factionTemplate: RACE_FACTION_TEMPLATE.get(1)!, reputation: () => null };
-  const target = creaturesNear(spawns, start, 200)
+  const target = staticCreatureLocator(world).creaturesNear(start, 200)
     .map((spawn) => combat.infos.info(spawn.guid)!)
     .filter((info) => info && info.level <= 3 && info.type !== 8 && info.aiName === ""
       && combat.factions.creatureToPlayer(info.factionTemplate, player) < REP_FRIENDLY
@@ -219,6 +225,7 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("Fireball damages 
   const move = new ByteWriter().writeU8(1).writeU8(1).writeU32(0).writeU16(0).writeU32(1)
     .writeF32(target.home.x - 3).writeF32(target.home.y).writeF32(target.home.z).writeF32(0).writeU32(0).toUint8Array();
   (await session.handle(0x0ee, move)).packets.forEach(decode);
+  advanceMaps(600);
   session.stats!.setMaxPower(0, 100);
   session.stats!.setPower(0, 100);
   // `MagicSpellHitResult` caps the hit chance at 100%; the bonus removes the random miss from this test.
@@ -247,7 +254,8 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("a triggered damag
   const key = crypto.getRandomValues(new Uint8Array(40));
   await saveSessionKey(db.login, "TEST", key);
   const world = await acoreWorldData();
-  const spawns = indexSpawns(world);
+  setUpTestMapWorld(world);
+  const spawns = mapCreatureLocator;
   const spells = await SpellStore.load("data/dbc", world.tables());
   const session = new WorldSession(db, world, spawns, undefined, null, undefined, undefined, undefined, spells);
   const received: number[] = [];
@@ -265,7 +273,7 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("a triggered damag
   const combat = combatWorldFor(world, spawns, world.tables(), null);
   const start = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
   const player = { race: 1, classId: 1, factionTemplate: RACE_FACTION_TEMPLATE.get(1)!, reputation: () => null };
-  const target = creaturesNear(spawns, start, 200)
+  const target = staticCreatureLocator(world).creaturesNear(start, 200)
     .map((spawn) => combat.infos.info(spawn.guid)!)
     .filter((info) => info && info.level <= 3 && info.type !== 8 && info.aiName === ""
       && combat.factions.creatureToPlayer(info.factionTemplate, player) < REP_FRIENDLY
@@ -275,6 +283,7 @@ test.skipIf(!(await Bun.file("data/dbc/Spell.dbc").exists()))("a triggered damag
   const move = new ByteWriter().writeU8(1).writeU8(1).writeU32(0).writeU16(0).writeU32(1)
     .writeF32(target.home.x - 3).writeF32(target.home.y).writeF32(target.home.z).writeF32(0).writeU32(0).toUint8Array();
   (await session.handle(0x0ee, move)).packets.forEach(decode);
+  advanceMaps(600);
   received.length = 0;
   session.stats!.modSpellHitChance = 100;
   session.stats!.modMeleeHitChance = 100;

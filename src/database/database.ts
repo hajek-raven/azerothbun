@@ -67,3 +67,44 @@ export function affectedRows(result: unknown): number {
 export function executeAsync(statement: PromiseLike<unknown>, what: string): void {
   Promise.resolve(statement).catch((error: unknown) => logError("sql", `${what} failed`, error));
 }
+
+/** One result row of a generated prepared statement, by column position (`fields[0].Get<uint32>()`). */
+export type Fields = unknown[];
+
+/**
+ * `Database.Query(stmt)` for a statement from `src/gen/*Database.gen.ts`: the rows as column arrays, in the order the
+ * SELECT lists them, so a C++ `fields[i]` reads as `row[i]`.
+ */
+export async function queryFields(db: Db, sql: string, ...params: unknown[]): Promise<Fields[]> {
+  return (await clientOf(db).unsafe(sql, params).values()) as Fields[];
+}
+
+/** `Database.Query(stmt)` with the rows keyed by column name. */
+export async function queryRows<T = Record<string, unknown>>(db: Db, sql: string, ...params: unknown[]): Promise<T[]> {
+  return [...((await clientOf(db).unsafe(sql, params)) as T[])];
+}
+
+/** `Database.Execute(stmt)` / `DirectExecute(stmt)`, awaited. Returns the rows changed. */
+export async function executeStatement(db: Db, sql: string, ...params: unknown[]): Promise<number> {
+  return affectedRows(await clientOf(db).unsafe(sql, params));
+}
+
+/** `Database.Execute(stmt)` from code that does not wait; the pool keeps it in order before later reads. */
+export function executeStatementAsync(db: Db, sql: string, ...params: unknown[]): void {
+  executeAsync(clientOf(db).unsafe(sql, params), sql);
+}
+
+/** A `CharacterDatabaseTransaction` of generated statements: `Append` each, then `CommitTransaction` (all or nothing). */
+export type StatementTransaction = [sql: string, ...params: unknown[]][];
+
+/** `Database.CommitTransaction(trans)` for statements appended to a `StatementTransaction`. */
+export async function commitTransaction(db: Db, trans: StatementTransaction): Promise<void> {
+  if (trans.length === 0) return;
+  await clientOf(db).begin(async (tx) => {
+    for (const [sql, ...params] of trans) await tx.unsafe(sql, params);
+  });
+}
+
+function clientOf(db: Db): SQL {
+  return db.$client;
+}

@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import type { Db } from "../database/database.ts";
 import { realmcharacters } from "../database/schema/auth.ts";
 import { character_homebind, characters } from "../database/schema/characters.ts";
-import { objectGuids } from "../game/globals/object-guids.ts";
+import { objectGuids } from "../game/Globals/object-guids.ts";
 import type { PlayerStart } from "../data/player-create.ts";
 import {
   CHAR_CREATE_ACCOUNT_LIMIT,

@@ -42,6 +42,11 @@ export function makeRegistrationData(username: string, password: string): Regist
   return { salt, verifier: calculateVerifier(upperLatin(username), password, salt) };
 }
 
+/** `SRP6::CheckLogin`: the stored verifier matches the one the username, password, and salt give. */
+export function checkLogin(username: string, password: string, salt: Uint8Array, verifier: Uint8Array): boolean {
+  return equalBytes(calculateVerifier(upperLatin(username), password, salt), verifier);
+}
+
 export function beginServerChallenge(username: string, salt: Uint8Array, verifier: Uint8Array): ServerChallenge {
   const secretBytes = randomBytes(EPHEMERAL_LENGTH);
   const secret = bytesToBigIntLE(secretBytes);

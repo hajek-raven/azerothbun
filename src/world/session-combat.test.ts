@@ -24,7 +24,8 @@ import { authSeed, CMSG_AUTH_SESSION, sessionDigest } from "./packets.ts";
 import { QuestParty } from "./party.ts";
 import { PlayerView } from "./players.ts";
 import { WorldSession } from "./session.ts";
-import { creaturesNear, indexSpawns } from "./spawn.ts";
+import { mapCreatureLocator } from "./map-world.ts";
+import { advanceMaps, setUpTestMapWorld, staticCreatureLocator, tearDownTestMapWorld } from "./map-world.test-util.ts";
 
 const SMSG_LOOT_RESPONSE = 0x160;
 const MSG_MOVE_HEARTBEAT = 0x0ee;
@@ -33,7 +34,8 @@ test(
   "the seeded warrior kills an attackable Northshire creature and loots it",
   async () => {
     const world = await acoreWorldData();
-    const spawns = indexSpawns(world);
+    setUpTestMapWorld(world);
+    const spawns = mapCreatureLocator;
     const db = await seededTestDatabases(world.tables());
     const sessionKey = crypto.getRandomValues(new Uint8Array(40));
     await saveSessionKey(db.login, "TEST", sessionKey);
@@ -53,7 +55,7 @@ test(
     const combat = combatWorldFor(world, spawns, world.tables(), null);
     const start = { map: 0, x: -8949.95, y: -132.493, z: 83.5312 };
     const player = { race: 1, classId: 1, factionTemplate: RACE_FACTION_TEMPLATE.get(1)!, reputation: () => null };
-    const target = creaturesNear(spawns, start, 200)
+    const target = staticCreatureLocator(world).creaturesNear(start, 200)
       .map((spawn) => combat.infos.info(spawn.guid)!)
       .filter(
         (info) =>
@@ -72,6 +74,8 @@ test(
     const at = { x: info.home.x - 2, y: info.home.y, z: info.home.z };
     received.length = 0;
     (await session.handle(MSG_MOVE_HEARTBEAT, movement(1n, at.x, at.y, at.z, 0))).packets.forEach(decode);
+    // the creature comes into view after the visibility delay of the map
+    advanceMaps(600);
     (await session.handle(CMSG_ATTACKSWING, new ByteWriter().writeU64(info.guid).toUint8Array())).packets.forEach(decode);
     expect(received.some((packet) => packet.opcode === SMSG_ATTACKSTART)).toBe(true);
 
@@ -110,6 +114,7 @@ test(
       expect(received.some((packet) => packet.opcode === SMSG_LOOT_RESPONSE)).toBe(true);
     }
     await session.disconnect();
+    tearDownTestMapWorld();
   },
   60_000,
 );

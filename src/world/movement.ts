@@ -141,7 +141,7 @@ export function movementKind(opcode: number): MovementKind | null {
   return null;
 }
 
-export function readMoveInfo(kind: MovementKind, payload: Uint8Array): MoveInfo | null {
+export function readMoveInfo(kind: MovementKind, payload: Uint8Array, allowedFlags = 0): MoveInfo | null {
   if (kind === "worldport") {
     return empty();
   }
@@ -174,7 +174,7 @@ export function readMoveInfo(kind: MovementKind, payload: Uint8Array): MoveInfo 
       reader.readU32();
     }
     const rawFlags = reader.readU32();
-    info.flags = sanitizeFlags(rawFlags);
+    info.flags = sanitizeFlags(rawFlags, allowedFlags);
     info.flags2 = reader.readU16();
     info.time = reader.readU32();
     info.x = reader.readF32();
@@ -327,8 +327,13 @@ export function forceSpeedChangePacket(crypt: WorldCrypt, moveType: number, guid
   return ack === undefined ? null : forceSpeedPacket(crypt, ack, guid, counter, speed);
 }
 
-export function sanitizeFlags(flags: number): number {
-  let next = flags & ~ROOT & ~HOVER & ~WATERWALKING & ~FALLING_SLOW & ~(FLYING | CAN_FLY) & ~SPLINE_ENABLED;
+/**
+ * `WorldSession::ReadMovementInfo` `REMOVE_VIOLATING_FLAGS`: `allowedFlags` holds the hover, water walk, feather fall,
+ * and fly flags the player's auras or account level permit (`movementFlagsAllowed`).
+ */
+export function sanitizeFlags(flags: number, allowedFlags = 0): number {
+  const violating = (HOVER | WATERWALKING | FALLING_SLOW | FLYING | CAN_FLY) & ~allowedFlags;
+  let next = flags & ~ROOT & ~violating & ~SPLINE_ENABLED;
   if (next & ASCENDING && next & DESCENDING) {
     next &= ~(ASCENDING | DESCENDING);
   }
@@ -415,4 +420,14 @@ function packedGuid(guid: bigint): Uint8Array {
     }
   }
   return Uint8Array.of(mask, ...bytes);
+}
+
+/** The movement flags `ReadMovementInfo` lets through for the player: hover, water walk, feather fall, and flight auras, or a GM account for flight. */
+export function movementFlagsAllowed(auras: { hover: boolean; waterWalk: boolean; ghost: boolean; featherFall: boolean; fly: boolean }, security: number): number {
+  let allowed = 0;
+  if (auras.hover) allowed |= HOVER;
+  if (auras.waterWalk || auras.ghost) allowed |= WATERWALKING;
+  if (auras.featherFall) allowed |= FALLING_SLOW;
+  if (security !== 0 || auras.fly) allowed |= FLYING | CAN_FLY;
+  return allowed >>> 0;
 }

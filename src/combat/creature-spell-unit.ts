@@ -1,3 +1,4 @@
+import { GetCollisionHeight } from "../game/Entities/Unit/UnitCollision.ts";
 import { packedGuid } from "../world/update-object.ts";
 import type { AuraEffect } from "../spells/aura.ts";
 import * as E from "../spells/enums.ts";
@@ -8,6 +9,7 @@ import type { CreatureUnit } from "./combat-world.ts";
 import { isWorldBoss, type CreatureInfo } from "./creature.ts";
 import type { FactionStore, ReactionPlayer } from "./faction.ts";
 import type { Point } from "./formulas.ts";
+import type { MovementOwner } from "../game/Movement/MovementOwner.ts";
 
 const f = Math.fround;
 
@@ -43,12 +45,34 @@ export interface CreatureWorld extends SpellMap {
   creatureAddThreat(unit: CreatureUnit, attacker: SpellUnit, amount: number): void;
   /** Values update of the listed fields to every viewer. */
   creatureFieldsChanged(unit: CreatureUnit, fields: { index: number; value: number }[]): void;
-  creatureAttackStop(unit: CreatureUnit): void;
-  /** `MotionMaster::Clear` + `StopMoving` (root and stun). */
+  /** `Unit::AttackStop`: true when the creature had a victim. */
+  creatureAttackStop(unit: CreatureUnit): boolean;
+  /** `Unit::StopMoving` (root and stun). */
   creatureStopMoving(unit: CreatureUnit): void;
+  /** `Unit::NearTeleportTo` */
   creatureNearTeleport(unit: CreatureUnit, position: { x: number; y: number; z: number; o: number }): void;
   creatureVictim(unit: CreatureUnit): SpellUnit | null;
   creatureUnitFlags(unit: CreatureUnit): number;
+  /** `MotionMaster::propagateSpeedChange` after the spell unit changed a speed rate. */
+  creaturePropagateSpeedChange(unit: CreatureUnit): void;
+
+  // What a `Creature` linked to this unit (`Creature::m_combatUnit`) asks for the `Unit` members the movement code calls.
+  /** `Unit::GetVictim`: the map object of the player the creature attacks. */
+  creatureVictimObject(unit: CreatureUnit): MovementOwner | null;
+  /** `Unit::Attack`: the combat world sets the victim, sends `SMSG_ATTACKSTART` and the target fields. */
+  creatureAttack(unit: CreatureUnit, victim: MovementOwner, meleeAttack: boolean): boolean;
+  /** `Unit::EngageWithTarget` */
+  creatureEngageWithTarget(unit: CreatureUnit, target: MovementOwner): void;
+  /** `Unit::IsValidAttackTarget` */
+  creatureIsValidAttackTarget(unit: CreatureUnit, target: MovementOwner): boolean;
+  /** `CreatureAI::_EnterEvadeMode`: the combat world's part (threat list, tap, damage requirement, auras, packets). */
+  creatureEvadeCombat(unit: CreatureUnit): void;
+  /** `ObjectAccessor::GetUnit`: a player in this world or a creature spawn. */
+  creatureUnitObject(unit: CreatureUnit, guid: bigint): MovementOwner | null;
+  /** `Creature::SetNoCallAssistance` */
+  creatureSetNoCallAssistance(unit: CreatureUnit, value: boolean): void;
+  /** `Creature::CallAssistance` */
+  creatureCallAssistance(unit: CreatureUnit): void;
 }
 
 /** A unit whose faction standing `FactionStore` can resolve (players). */
@@ -371,6 +395,9 @@ export class CreatureSpellUnit extends SpellUnit {
     this.stats = new CreatureStats(unit.info, (fields) => this.world.creatureFieldsChanged(this.unit, fields));
     this.power0 = unit.info.maxMana;
     this.speedRate[E.MOVE_RUN] = unit.info.runSpeed / 7;
+    // the map object's speeds (`Creature::InitEntry` `SetSpeed`) are the start of the aura modifiers
+    const creature = unit.creature;
+    if (creature) for (let type = 0; type < this.speedRate.length; type++) this.speedRate[type] = creature.getSpeedRate(type);
     this.loadTemplateImmunities();
   }
 
@@ -416,6 +443,15 @@ export class CreatureSpellUnit extends SpellUnit {
 
   get combatReach(): number {
     return this.unit.info.combatReach;
+  }
+
+  override collisionHeight(): number {
+    const info = this.unit.info;
+    return GetCollisionHeight({ scale: info.scale ?? 1, nativeDisplayId: info.displayId ?? 0, mountDisplayId: 0 });
+  }
+
+  override get phaseMask(): number {
+    return this.unit.info.phaseMask;
   }
 
   get boundingRadius(): number {
@@ -533,7 +569,7 @@ export class CreatureSpellUnit extends SpellUnit {
   }
 
   isMoving(): boolean {
-    return this.unit.move !== null;
+    return this.unit.creature?.isMoving() ?? false;
   }
 
   isEvading(): boolean {
@@ -600,6 +636,8 @@ export class CreatureSpellUnit extends SpellUnit {
 
   /** `Unit::SetSpeed` → `SMSG_SPLINE_SET_*_SPEED` for a unit without a controlling client. */
   sendSpeed(moveType: number, speed: number): void {
+    // `Unit::SetSpeed` -> `propagateSpeedChange`: the generators recompute their splines with the new speed
+    this.world.creaturePropagateSpeedChange(this.unit);
     const opcode = SPLINE_SPEED_OPCODES[moveType];
     if (opcode === undefined) return;
     this.sendToSet(opcode, splineSetRunSpeedPacket(this.guid, speed));

@@ -273,23 +273,23 @@ function emptyActive(): ActiveQuest {
   };
 }
 
-function isDaily(q: QuestTemplate): boolean {
+export function isDaily(q: QuestTemplate): boolean {
   return (q.flags & QUEST_FLAGS_DAILY) !== 0;
 }
 
-function isWeekly(q: QuestTemplate): boolean {
+export function isWeekly(q: QuestTemplate): boolean {
   return (q.flags & QUEST_FLAGS_WEEKLY) !== 0;
 }
 
-function isMonthly(q: QuestTemplate): boolean {
+export function isMonthly(q: QuestTemplate): boolean {
   return (q.specialFlags & QUEST_SPECIAL_MONTHLY) !== 0;
 }
 
-function isRepeatable(q: QuestTemplate): boolean {
+export function isRepeatable(q: QuestTemplate): boolean {
   return (q.specialFlags & QUEST_SPECIAL_REPEATABLE) !== 0;
 }
 
-function isSeasonal(q: QuestTemplate): boolean {
+export function isSeasonal(q: QuestTemplate): boolean {
   if (isRepeatable(q)) {
     return false;
   }
@@ -1113,11 +1113,16 @@ export class QuestLog {
   }
 
   accept(questId: number): "ok" | "full" | "denied" {
-    const quest = this.catalog.quest(questId);
-    if (!quest) {
+    if (!this.catalog.quest(questId) || !this.canTake(questId, this.speaker)) {
       return "denied";
     }
-    if (!this.canTake(questId, this.speaker)) {
+    return this.addQuest(questId);
+  }
+
+  /** `Player::CanAddQuest` + `AddQuestAndCheckCompletion` without `CanTakeQuest` (`.quest add`): only a free log slot is needed. */
+  addQuest(questId: number): "ok" | "full" | "denied" {
+    const quest = this.catalog.quest(questId);
+    if (!quest || this.activeQuests.has(questId)) {
       return "denied";
     }
     if (this.activeQuests.size >= QUEST_LOG_SLOT_COUNT) {
@@ -1239,6 +1244,28 @@ export class QuestLog {
       choiceCount: choiceCountValue,
       items,
     };
+  }
+
+  /** `Player::RemoveActiveQuest` + `RemoveRewardedQuest` (`.quest remove`): the quest leaves the log and the rewarded set. */
+  removeQuest(questId: number): void {
+    if (this.activeQuests.delete(questId)) this.vacate(questId);
+    this.rewardedQuests.delete(questId);
+    this.dailyQuests.delete(questId);
+    this.weeklyQuests.delete(questId);
+    this.monthlyQuests.delete(questId);
+    this.seasonalQuests.delete(questId);
+  }
+
+  /** @ac game/Entities/Player/PlayerQuest.cpp Player::CompleteQuest (the objectives are filled and the status is complete) */
+  forceComplete(questId: number): boolean {
+    const aq = this.activeQuests.get(questId);
+    const quest = this.catalog.quest(questId);
+    if (!aq || !quest) return false;
+    for (let i = 0; i < 4; i++) aq.mob[i] = quest.requiredNpcOrGoCount[i] ?? 0;
+    for (let i = 0; i < 6; i++) aq.item[i] = quest.requiredItemCount[i] ?? 0;
+    aq.explored = 1;
+    aq.status = QUEST_STATUS_COMPLETE;
+    return true;
   }
 
   creditKill(entry: number, guid: bigint): Credit[] {

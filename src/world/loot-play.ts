@@ -184,7 +184,7 @@ function lootError(guid: bigint, error: LootErrorValue): PlayPacket {
 }
 
 /** `Player::SendEquipError` without items. */
-function equipError(msg: number, itemId: number, ctx: LootPlayCtx): PlayPacket {
+export function equipError(msg: number, itemId: number, ctx: LootPlayCtx): PlayPacket {
   const limitCategory = lookupTemplate(ctx.world, itemId)?.ItemLimitCategory ?? 0;
   return pkt(SMSG_INVENTORY_CHANGE_FAILURE, "SMSG_INVENTORY_CHANGE_FAILURE", buildInventoryChangeFailure(msg, 0n, 0n, 0, limitCategory));
 }
@@ -361,7 +361,7 @@ export async function storeLootItem(lootSlot: number, loot: Loot, ctx: LootPlayC
  * `Player::StoreNewItem` → `Item::CreateItem` + `Player::StoreItem`: fills the stacks in `dest` and creates an item for each
  * free slot, binding it the way `_StoreItem` does. Returns the last stored item, which `SendNewItem` reports.
  */
-async function storeNewItem(
+export async function storeNewItem(
   dest: readonly ItemPosCount[],
   entry: number,
   randomPropertyId: number,
@@ -418,7 +418,7 @@ async function storeNewItem(
 }
 
 /** `Item::GetBagSlot`: INVENTORY_SLOT_BAG_0 in the backpack, else the equipped bag's slot. */
-function bagSlotOf(inventory: Inventory, bag: number): number {
+export function bagSlotOf(inventory: Inventory, bag: number): number {
   return bag === 0 ? INVENTORY_SLOT_BAG_0 : (getItemPos(inventory, bag)?.slot ?? INVENTORY_SLOT_BAG_0);
 }
 

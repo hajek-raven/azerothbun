@@ -1,7 +1,7 @@
 import { asc, eq } from "drizzle-orm";
 import type { Db } from "../database/database.ts";
 import { character_equipmentsets } from "../database/schema/characters.ts";
-import { generateEquipmentSetGuid } from "../game/globals/object-guids.ts";
+import { generateEquipmentSetGuid } from "../game/Globals/object-guids.ts";
 import { ByteReader, ByteWriter } from "../net/byte-buffer.ts";
 
 /** SMSG_EQUIPMENT_SET_LIST — Opcodes.h 0x4BC */

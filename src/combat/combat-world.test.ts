@@ -1,11 +1,17 @@
-import { beforeEach, describe, expect, test } from "bun:test";
-import { Loot } from "../loot/loot.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { MySqlTable } from "drizzle-orm/mysql-core";
 import { seedRandom } from "../common/random.ts";
-import type { CreatureSpawn, CreatureTemplate, WorldData } from "../data/world.ts";
-import { indexSpawns } from "../world/spawn.ts";
+import type { WorldData } from "../data/world.ts";
+import { advanceMaps, setUpTestMapWorld, tearDownTestMapWorld } from "../world/map-world.test-util.ts";
+import { mapCreatureLocator } from "../world/map-world.ts";
+import type { Creature } from "../game/Entities/Creature/Creature.ts";
+import { sMapMgr } from "../game/Maps/MapMgr.ts";
+import type { Map as AcMap } from "../game/Maps/Map.ts";
+import { addRows, creatureRow, creatureTemplateRows, loadSpawnFixture, worldSchema as w } from "../game/Maps/SpawnData.test-util.ts";
 import { ConfigMgr, ConfigSeverity, defaultConfigPolicy } from "../common/config.ts";
 import { WorldConfig } from "../game/world/world-config.ts";
-import { CombatWorld, configureCombatRates, DEFAULT_COMBAT_RATES, type CombatPlayer, type CreatureKill, type PlayerMelee } from "./combat-world.ts";
+import { CombatWorld, configureCombatRates, DEFAULT_COMBAT_RATES, type PlayerMelee } from "./combat-world.ts";
+import { factionTemplate, joinWorld, melee, testCombatPlayer, type TestCombatPlayer } from "./combat.test-util.ts";
 import {
   SMSG_AI_REACTION,
   SMSG_ATTACKERSTATEUPDATE,
@@ -15,14 +21,13 @@ import {
   SMSG_ATTACKSWING_NOTINRANGE,
   SMSG_MONSTER_MOVE,
   SMSG_PARTYKILLLOG,
-  SMSG_UPDATE_OBJECT,
   UNIT_DYNFLAG_DEAD,
   UNIT_DYNFLAG_LOOTABLE,
   UNIT_DYNFLAG_TAPPED,
   UNIT_DYNFLAG_TAPPED_BY_PLAYER,
   UNIT_FLAG_IN_COMBAT,
 } from "./constants.ts";
-import { FactionStore, type FactionTemplate } from "./faction.ts";
+import { FactionStore } from "./faction.ts";
 import { UNIT_DYNAMIC_FLAGS, UNIT_FIELD_HEALTH, updateFieldValue } from "./packets.ts";
 
 const HOME = { x: 100, y: 100, z: 10 };
@@ -30,204 +35,87 @@ const WOLF = 1;
 const GUARD = 2;
 const FAR_WOLF = 3;
 
-function factionTemplate(id: number, faction: number, ourMask: number, friendlyMask: number, hostileMask: number): FactionTemplate {
-  return { id, faction, flags: 1, ourMask, friendlyMask, hostileMask, enemyFaction: [0, 0, 0, 0], friendFaction: [0, 0, 0, 0] };
+type FakePlayer = TestCombatPlayer;
+
+/** The creatures of the test, as the `creature` / `creature_template` rows the map layer loads. */
+function spawnRows(): Map<MySqlTable, Record<string, unknown>[]> {
+  const rows = new Map<MySqlTable, Record<string, unknown>[]>();
+  const [wolf, wolfModel] = creatureTemplateRows(299, { faction: 14, type: 1, minlevel: 1, maxlevel: 1 });
+  const [guard, guardModel] = creatureTemplateRows(68, { faction: 12, type: 7, minlevel: 1, maxlevel: 1 });
+  addRows(rows, w.creature_template, wolf!, guard!);
+  addRows(rows, w.creature_template_model, wolfModel!, guardModel!);
+  addRows(rows, w.creature_model_info, { DisplayID: 1299, BoundingRadius: 0.5, CombatReach: 1.5, Gender: 2 }, { DisplayID: 1068, BoundingRadius: 0.5, CombatReach: 1.5, Gender: 2 });
+  addRows(rows, w.creature_classlevelstats, { level: 1, class: 1, basehp0: 40, basehp1: 1, basehp2: 1, basemana: 0, basearmor: 20, attackpower: 0, rangedattackpower: 0, damage_base: 3, damage_exp1: 3, damage_exp2: 3 });
+  addRows(
+    rows,
+    w.creature,
+    creatureRow(WOLF, 299, 0, HOME.x, HOME.y, { position_z: HOME.z, orientation: Math.PI, spawntimesecs: 300 }),
+    creatureRow(GUARD, 68, 0, HOME.x + 8, HOME.y, { position_z: HOME.z, orientation: Math.PI, spawntimesecs: 300 }),
+    creatureRow(FAR_WOLF, 299, 0, HOME.x + 400, HOME.y, { position_z: HOME.z, orientation: Math.PI, spawntimesecs: 300 }),
+  );
+  return rows;
 }
 
-function template(entry: number, faction: number, type: number): CreatureTemplate {
-  return {
-    entry,
-    name: `creature ${entry}`,
-    subName: "",
-    iconName: "",
-    minLevel: 1,
-    maxLevel: 1,
-    expansion: 0,
-    faction,
-    npcFlags: 0,
-    gossipMenuId: 0,
-    unitClass: 1,
-    unitFlags: 0,
-    unitFlags2: 0,
-    dynamicFlags: 0,
-    family: 0,
-    type,
-    typeFlags: 0,
-    rank: 0,
-    killCredit: [0, 0],
-    healthMod: 1,
-    manaMod: 1,
-    armorMod: 1,
-    damageMod: 1,
-    resistances: [0, 0, 0, 0, 0, 0, 0],
-    racialLeader: 0,
-    movementId: 0,
-    speedWalk: 1,
-    speedRun: 1,
-    speedSwim: 1,
-    speedFlight: 1,
-    hoverHeight: 1,
-    models: [{ idx: 0, displayId: 100, scale: 1, boundingRadius: 0.5, combatReach: 1.5, gender: 2 }],
-    equipment: [],
-  };
-}
-
-function spawn(guid: number, entry: number, x: number, y: number): CreatureSpawn {
-  return { guid, entry, map: 0, x, y, z: HOME.z, orientation: Math.PI, spawnMask: 1, phaseMask: 1, equipmentId: 0, health: 0, mana: 0, npcFlags: 0, unitFlags: 0, dynamicFlags: 0 };
-}
-
-function fakeWorld(): WorldData {
-  const templates = new Map([
-    [299, template(299, 14, 1)],
-    [68, template(68, 12, 7)],
-  ]);
-  return {
-    creaturesOnMap: [spawn(WOLF, 299, HOME.x, HOME.y), spawn(GUARD, 68, HOME.x + 8, HOME.y), spawn(FAR_WOLF, 299, HOME.x + 400, HOME.y)],
-    gameObjectsOnMap: [],
-    creatureTemplate: (entry: number) => templates.get(entry),
-    creatureClassLevelStats: () => ({
-      level: 1,
-      classId: 1,
-      baseHp: [40, 1, 1],
-      baseMana: 0,
-      baseArmor: 20,
-      attackPower: 0,
-      rangedAttackPower: 0,
-      damage: [3, 3, 3],
-      strength: 0,
-      agility: 0,
-      stamina: 0,
-      intellect: 0,
-      spirit: 0,
-    }),
-    gameObjectTemplate: () => undefined,
-    itemTemplate: () => undefined,
-    playerStart: () => null,
-    questItems: () => [],
-  } as unknown as WorldData;
-}
-
-type FakePlayer = CombatPlayer & {
-  sent: number[];
-  updates: Uint8Array[];
-  place: { map: number; x: number; y: number; z: number; o: number };
-  hp: number;
-  dead: boolean;
-  combat: boolean[];
-  kills: CreatureKill[];
-  known: Set<bigint>;
-  refreshes: number;
-};
-
-function melee(overrides: Partial<PlayerMelee> = {}): PlayerMelee {
-  return {
-    attackTime: () => 2000,
-    hasOffhand: false,
-    damage: () => ({ min: 20, max: 20, school: 0 }),
-    crit: () => 0,
-    weaponSkill: () => 5,
-    maxSkill: 5,
-    defenseSkill: 5,
-    expertiseReduction: () => 0,
-    modMeleeHitChance: 100,
-    armorPenetrationPct: 0,
-    dodge: 0,
-    parry: 0,
-    block: 0,
-    blockValue: 0,
-    armor: 0,
-    missFromDefense: 0,
-    critTakenReduction: 0,
-    canParry: false,
-    canBlock: false,
-    usesRage: true,
-    ...overrides,
-  };
-}
-
+/** Builds a fake player; with a `map` it stands on it, so a chasing creature has an object to follow. */
 function fakePlayer(guid: number, place: { x: number; y: number; z: number; o: number }, stats: PlayerMelee = melee()): FakePlayer {
-  const player: FakePlayer = {
-    guid,
-    sent: [],
-    updates: [],
-    place: { map: 0, ...place },
-    hp: 100,
-    dead: false,
-    combat: [],
-    kills: [],
-    known: new Set(),
-    refreshes: 0,
-    name: () => `player${guid}`,
-    position: () => player.place,
-    level: () => 1,
-    race: () => 1,
-    classId: () => 1,
-    factionTemplate: () => 1,
-    reputation: () => null,
-    alive: () => !player.dead,
-    gameMaster: () => false,
-    sitting: () => false,
-    standUp: () => {},
-    moving: () => false,
-    mounted: () => false,
-    knows: (g) => player.known.has(g),
-    send: (opcode, body) => {
-      player.sent.push(opcode);
-      if (opcode === SMSG_UPDATE_OBJECT) {
-        player.updates.push(body);
-      }
-    },
-    broadcast: () => {},
-    health: () => player.hp,
-    melee: () => stats,
-    takeDamage: (amount) => {
-      player.hp = Math.max(0, player.hp - amount);
-      player.dead = player.hp === 0;
-      return player.dead;
-    },
-    addRage: () => {},
-    setInCombat: (on) => player.combat.push(on),
-    killedCreature: (kill) => {
-      player.kills.push(kill);
-      // A corpse with money on it (`Loot::generateMoneyLoot`).
-      const loot = new Loot({ itemProto: () => null, enchSuffixFactor: () => 0, randomPropertyId: () => 0 });
-      loot.gold = 5;
-      return loot;
-    },
-    combatSkill: () => {},
-    refreshSpawns: () => {
-      player.refreshes += 1;
-    },
-  };
-  return player;
+  const { session } = joinWorld(guid, place.x, place.y, place.z, activeCombat);
+  session.character.orientation = place.o;
+  return testCombatPlayer(guid, place, stats, session);
 }
 
-function setup(): { combat: CombatWorld; world: WorldData } {
-  const world = fakeWorld();
+let activeCombat: CombatWorld | null = null;
+
+/** The creature object of a spawn (`Map::GetCreatureBySpawnIdStore`), that records the visibility updates the combat code asks for. */
+function creatureObject(spawnGuid: number): { creature: Creature; visibilityUpdates: number } {
+  const creature = mapCreatureLocator.findCreature(0, spawnGuid)!;
+  const stub = { visibilityUpdates: 0, creature };
+  const original = creature.updateObjectVisibility.bind(creature);
+  creature.updateObjectVisibility = (forced?: boolean, fromUpdate?: boolean) => {
+    stub.visibilityUpdates += 1;
+    original(forced, fromUpdate);
+  };
+  return stub;
+}
+
+function setup(): { combat: CombatWorld; world: WorldData; map: AcMap } {
+  const { world } = loadSpawnFixture(spawnRows());
+  setUpTestMapWorld(world);
+  const map = sMapMgr().createBaseMap(0);
+  map.loadGrid(HOME.x, HOME.y);
   const factions = new FactionStore([
     factionTemplate(1, 1, 3, 2, 12),
     factionTemplate(12, 72, 2, 2, 4),
     factionTemplate(14, 14, 8, 0, 1),
   ]);
-  const combat = new CombatWorld(world, indexSpawns(world), null, null, factions);
-  return { combat, world };
+  const combat = new CombatWorld(world, mapCreatureLocator, world.tables(), null, factions);
+  activeCombat = combat;
+  return { combat, world, map };
 }
 
 function guidOf(combat: CombatWorld, spawnGuid: number): bigint {
   return combat.infos.info(spawnGuid)!.guid;
 }
 
-/** Ticks from `start` every 100 ms for `ms`. */
+/**
+ * Ticks from `start` every 100 ms for `ms`: the map update (`Creature::Update`: the spline and the motion master) and the combat
+ * update (`CreatureAI::UpdateAI`) in the order of `World::Update`.
+ */
 function run(combat: CombatWorld, start: number, ms: number): number {
   let now = start;
   for (let elapsed = 0; elapsed <= ms; elapsed += 100) {
     now = start + elapsed;
+    advanceMaps(100, 50);
     combat.update(now);
   }
   return now;
 }
 
 beforeEach(() => seedRandom(1234));
+
+afterEach(() => {
+  activeCombat = null;
+  tearDownTestMapWorld();
+});
 
 describe("player melee against a creature", () => {
   test("swings, tags, kills, rewards, and leaves a lootable corpse", () => {
@@ -278,6 +166,7 @@ describe("player melee against a creature", () => {
     combat.attackSwing(7, wolf);
     run(combat, 100, 1000);
     expect(player.sent.filter((op) => op === SMSG_ATTACKSWING_NOTINRANGE)).toHaveLength(1);
+    tearDownTestMapWorld();
     const facing = setup().combat;
     const turned = fakePlayer(8, { x: HOME.x - 2, y: HOME.y, z: HOME.z, o: Math.PI });
     facing.addPlayer(turned);
@@ -306,7 +195,8 @@ describe("creature AI", () => {
     run(combat, 0, 6000);
     expect(player.sent).toContain(SMSG_AI_REACTION);
     expect(player.sent).toContain(SMSG_ATTACKSTART);
-    expect(player.sent).toContain(SMSG_MONSTER_MOVE);
+    // the creature runs at the player: the player on the map receives the spline packets (`MoveSplineInit::Launch` -> `SendMessageToSet`)
+    expect(player.session!.count(SMSG_MONSTER_MOVE)).toBeGreaterThan(0);
     expect(player.hp).toBeLessThan(100);
     expect(combat.inCombat(7)).toBe(true);
     expect(combat.liveView(WOLF, 7)!.unitFlags & UNIT_FLAG_IN_COMBAT).toBe(UNIT_FLAG_IN_COMBAT);
@@ -342,7 +232,7 @@ describe("creature AI", () => {
   test("a friendly guard does not pull and an out-of-range wolf stays put", () => {
     const { combat } = setup();
     const player = fakePlayer(7, { x: HOME.x + 8, y: HOME.y + 3, z: HOME.z, o: 0 });
-    player.place.x = HOME.x + 200;
+    player.place = { ...player.place, x: HOME.x + 200 };
     combat.addPlayer(player);
     run(combat, 0, 2000);
     expect(combat.inCombat(7)).toBe(false);
@@ -366,6 +256,7 @@ describe("creature AI", () => {
 describe("corpse and respawn", () => {
   test("corpse decays after Corpse.Decay.NORMAL, hides, then respawns after spawntimesecs", () => {
     const { combat } = setup();
+    const wolfObject = creatureObject(WOLF);
     const player = fakePlayer(7, { x: HOME.x - 2, y: HOME.y, z: HOME.z, o: 0 }, melee({ damage: () => ({ min: 100, max: 100, school: 0 }) }));
     const wolf = guidOf(combat, WOLF);
     player.known.add(wolf);
@@ -382,7 +273,10 @@ describe("corpse and respawn", () => {
     now = run(combat, now + 1000, 31_000);
     expect(combat.creature(WOLF)!.deathState).toBe("dead");
     expect(combat.liveView(WOLF, 7)!.hidden).toBe(true);
-    expect(player.refreshes).toBeGreaterThan(0);
+    // the corpse went: `Creature::RemoveCorpse` updates the visibility of the creature object (its viewers destroy it)
+    expect(wolfObject.visibilityUpdates).toBeGreaterThan(0);
+    // the creature object reads the unit's state while the unit lives
+    expect(wolfObject.creature.m_combatUnit).not.toBeNull();
     // default spawntimesecs 300, minus the looted reduction
     now = run(combat, now + 1000, 300_000);
     const respawned = combat.creature(WOLF);

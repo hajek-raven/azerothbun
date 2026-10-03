@@ -1552,6 +1552,11 @@ export class SpellStore {
     return this.spells.size;
   }
 
+  /** Every spell id in `Spell.dbc` and `spell_dbc`, ascending. */
+  ids(): number[] {
+    return this.spells.ids();
+  }
+
   get(id: number): SpellInfo | null {
     const cached = this.cache.get(id);
     if (cached !== undefined) {

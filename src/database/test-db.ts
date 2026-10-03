@@ -1,5 +1,5 @@
 import { SQL } from "bun";
-import { resetObjectGuids } from "../game/globals/object-guids.ts";
+import { resetObjectGuids } from "../game/Globals/object-guids.ts";
 import { log } from "../log.ts";
 import { openDatabase, parseDatabaseInfo, type Db } from "./database.ts";
 import { populateDatabase, updateDatabase } from "./updater.ts";

@@ -13,7 +13,7 @@ import type { FileSink } from "bun";
  * - `LOG_PACKETS` `1` traces every packet in both directions; or a comma list of opcode names
  *                 (`CMSG_CAST_SPELL,SMSG_SPELL_GO`); `hex` adds a hex dump of the body
  */
-export type LogScope = "auth" | "world" | "hot" | "server" | "packet" | "spell" | "combat" | "loot" | "quest" | "movement" | "sql" | "sql.updates";
+export type LogScope = "auth" | "world" | "hot" | "server" | "packet" | "spell" | "combat" | "loot" | "quest" | "movement" | "maps" | "sql" | "sql.updates" | "chat" | "commands" | "gm";
 
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
 
